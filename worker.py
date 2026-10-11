@@ -192,6 +192,22 @@ def find_font(name):
     return None
 
 
+def video_size(path):
+    """Ширина и высота видео — нужны, чтобы понять, куда встанет баннер."""
+    probe = shutil.which("ffprobe")
+    if probe:
+        try:
+            out = run([probe, "-v", "error", "-select_streams", "v:0",
+                       "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)])
+            w, h = out.strip().splitlines()[0].split(",")[:2]
+            return int(w), int(h)
+        except Exception:
+            pass
+    err = subprocess.run([FF, "-hide_banner", "-i", str(path)], capture_output=True, text=True).stderr
+    m = re.search(r", (\d{2,5})x(\d{2,5})", err)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
 def duration(path):
     probe = shutil.which("ffprobe")
     if probe:
@@ -393,11 +409,12 @@ def chunk_words(words):
     return lines
 
 
-def make_ass(words, path):
+def make_ass(words, path, sub_y_px=None):
     if not words and not SUBSCRIBE["enabled"]:
         return False
     s = SUB
     sb = SUBSCRIBE
+    sub_top = int(sub_y_px) if sub_y_px else int(H * sb["y"])
     head = (
         "[Script Info]\nScriptType: v4.00+\n"
         f"PlayResX: {W}\nPlayResY: {H}\nWrapStyle: 2\n\n"
@@ -408,7 +425,7 @@ def make_ass(words, path):
         f"Style: Default,{s['font']},{s['size']},{s['color']},&H000000FF,{s['outline_color']},&H00000000,"
         f"0,0,0,0,100,100,0,0,1,{s['outline']},{s['shadow']},{s['align']},60,60,{s['margin_v']},1\n"
         f"Style: Sub,{s['font']},{sb['size']},{s['color']},&H000000FF,{s['outline_color']},&H00000000,"
-        f"0,0,0,0,100,100,0,0,1,{s['outline']},{s['shadow']},8,60,60,{int(H * sb['y'])},1\n\n"
+        f"0,0,0,0,100,100,0,0,1,{s['outline']},{s['shadow']},8,60,60,{sub_top},1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     groups = chunk_words(words) if words else []
@@ -552,7 +569,14 @@ def make_video(job, banner, d):
     notify("📝 Распознаю речь…")
     words = transcribe(audio)
     ass = d / "subs.ass"
-    ass_ok = make_ass(words, ass)
+    sub_top = None
+    if banner:
+        bw, bh = video_size(banner)
+        if bw:
+            # надпись «подпишись» ставим под баннером, чтобы не наезжала на него
+            sub_top = BANNER["margin"] + round(bh * BANNER["width"] / bw) + 40
+            print(f"баннер {bw}x{bh} → надпись начнётся с {sub_top}px")
+    ass_ok = make_ass(words, ass, sub_top)
 
     cover = None
     if job.get("cover_text"):
