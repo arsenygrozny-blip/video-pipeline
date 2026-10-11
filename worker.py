@@ -277,6 +277,19 @@ def download(url, out_dir, tag, audio=False):
     )
 
 
+def normalize(src, dst, dur):
+    vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+          f"setsar=1,fps={FPS},format=yuv420p")
+    run([FF, "-y", "-i", src, "-an", "-t", f"{dur + 1:.2f}", "-vf", vf,
+         "-c:v", "libx264", "-preset", PRESET, "-crf", "20", dst])
+
+
+def concat(clips, dst):
+    lst = dst.parent / "list.txt"
+    lst.write_text("".join(f"file '{Path(c).resolve()}'\n" for c in clips))
+    run([FF, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", dst])
+
+
 # ---------------------------- субтитры ----------------------------
 _models = {}
 
