@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 
@@ -263,7 +264,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not await guard(update):
         return
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception as e:
+        # кнопка могла устареть (Telegram отвечает "query is too old") — это не повод падать
+        print("callback answer:", e)
     data = q.data
     msg = q.message
     job = context.user_data.get("job")
@@ -328,6 +333,18 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Чтобы падение в обработчике не пропадало молча."""
+    err = context.error
+    print("ОШИБКА БОТА:", repr(err))
+    traceback.print_exception(type(err), err, err.__traceback__ if err else None)
+    try:
+        if getattr(update, "effective_message", None):
+            await update.effective_message.reply_text(f"⚠️ Внутренняя ошибка: {str(err)[:300]}")
+    except Exception:
+        pass
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Нет BOT_TOKEN")
@@ -343,6 +360,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.ALL, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
     print(f"Бот запущен (webhook). Ядро на Kaggle: {KAGGLE_USERNAME}/{KERNEL_SLUG}")
     app.run_webhook(
         listen="0.0.0.0",
