@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: video-bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # эти пять Render спросит при деплое — вписываешь свои
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_ID
+        sync: false
+      - key: KAGGLE_USERNAME
+        sync: false
+      - key: KAGGLE_KEY
+        sync: false
+      - key: COOKIES_TXT
+        sync: false
+      # необязательные настройки рендера
+      - key: KERNEL_SLUG
+        value: video-worker
+      - key: WHISPER_MODEL
+        value: large-v3
+      - key: JOB_TIMEOUT_MIN
+        value: "45"

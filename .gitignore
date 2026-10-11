@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+kaggle.json
+cookies.txt
+*.mp4
+*.jpg
