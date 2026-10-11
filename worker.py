@@ -209,39 +209,72 @@ def duration(path):
 
 
 # ---------------------------- скачивание ----------------------------
+JS_CANDIDATES = {
+    "deno": ["/usr/local/bin/deno", "/root/.deno/bin/deno", "/usr/bin/deno"],
+    "node": ["/tools/node/bin/node", "/usr/local/bin/node", "/usr/bin/node", "/usr/bin/nodejs"],
+    "bun": ["/usr/local/bin/bun", "/root/.bun/bin/bun"],
+}
+
+
+def find_js_runtime():
+    """Ищем JS-рантайм для yt-dlp. PATH в ядре Kaggle бывает урезан, поэтому
+    проверяем и известные пути вручную."""
+    for name, paths in JS_CANDIDATES.items():
+        found = shutil.which(name)
+        if found:
+            return name, None
+        for path in paths:
+            if Path(path).exists():
+                return name, path
+    return None, None
+
+
 def download(url, out_dir, tag, audio=False):
+    """Скачиваем через yt-dlp, не полагаясь на удачу.
+
+    Свежий yt-dlp хочет JS-рантайм — на Kaggle есть node, и с ним находится
+    больше форматов. Но если с рантаймом что-то не так, повторяем без него.
+    Плюс перебираем несколько форматов: не отдался лучший — берём попроще.
+    """
     import yt_dlp
-    opts = {
+
+    base = {
         "outtmpl": str(out_dir / f"{tag}_%(id)s.%(ext)s"),
-        "format": "bestaudio/best" if audio else "bv*/b",
         "quiet": True,
         "noprogress": True,
         "noplaylist": True,
-        "retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
     }
-    if JOB.get("cookies"):  # noqa: F821
-        cf = out_dir / "cookies.txt"
-        cf.write_text(JOB["cookies"], encoding="utf-8")  # noqa: F821
-        opts["cookiefile"] = str(cf)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        try:
-            return Path(info["requested_downloads"][0]["filepath"])
-        except Exception:
-            return Path(ydl.prepare_filename(info))
+    cookies = WORK / "cookies.txt"
+    if cookies.exists():
+        base["cookiefile"] = str(cookies)
 
-
-def normalize(src, dst, dur):
-    vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
-          f"setsar=1,fps={FPS},format=yuv420p")
-    run([FF, "-y", "-i", src, "-an", "-t", f"{dur + 1:.2f}", "-vf", vf,
-         "-c:v", "libx264", "-preset", PRESET, "-crf", "20", dst])
-
-
-def concat(clips, dst):
-    lst = dst.parent / "list.txt"
-    lst.write_text("".join(f"file '{Path(c).resolve()}'\n" for c in clips))
-    run([FF, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", dst])
+    js, js_path = find_js_runtime()
+    if js:
+        print(f"yt-dlp: JS-рантайм {js}" + (f" ({js_path})" if js_path else " (из PATH)"))
+    fmts = ["bestaudio/best", "best"] if audio else ["bv*/b", "b", "best"]
+    errors = []
+    for runtime in ([js] if js else []) + [None]:
+        for fmt in fmts:
+            opts = dict(base, format=fmt)
+            if runtime:
+                opts["js_runtimes"] = {runtime: ({"path": js_path} if js_path else {})}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    try:
+                        return Path(info["requested_downloads"][0]["filepath"])
+                    except Exception:
+                        return Path(ydl.prepare_filename(info))
+            except Exception as e:
+                errors.append(f"{fmt}{' + ' + runtime if runtime else ''}: {str(e)[:110]}")
+    raise RuntimeError(
+        "Не получилось скачать:\n" + "\n".join(errors[-4:]) + "\n\n"
+        "Если это YouTube и жалуется на вход/403 — положи cookies.txt в /kaggle/working."
+    )
 
 
 # ---------------------------- субтитры ----------------------------
