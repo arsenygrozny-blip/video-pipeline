@@ -133,12 +133,22 @@ def notify(text, final=False):
         raise Cancelled()
 
 
-def send_file(method, field, path, **data):
-    with open(path, "rb") as f:
+def send_file(method, field, path, extra=None, **data):
+    """extra — дополнительные файлы к тому же запросу (например, превью для видео)."""
+    files = {field: open(path, "rb")}
+    try:
+        for name, p in (extra or {}).items():
+            files[name] = open(p, "rb")
         r = requests.post(f"{API}/{method}", data={"chat_id": CHAT, **data},
-                          files={field: f}, timeout=1200)
-    if not r.ok:
-        raise RuntimeError(f"Telegram не принял файл: {r.text[:300]}")
+                          files=files, timeout=1200)
+        if not r.ok:
+            raise RuntimeError(f"Telegram не принял файл: {r.text[:300]}")
+    finally:
+        for fh in files.values():
+            try:
+                fh.close()
+            except Exception:
+                pass
 
 
 def fetch_telegram_file(file_id, dst):
@@ -623,10 +633,22 @@ def main():
             banner = fetch_telegram_file(JOB["banner_file_id"], d / "banner.bin")  # noqa: F821
         out, cover, dur = make_video(JOB, banner, d)  # noqa: F821
         notify("📤 Отправляю…")
+        thumb = None
+        if cover:
+            # превью для плеера: маленькая копия обложки
+            try:
+                img = Image.open(cover)
+                img.thumbnail((320, 320))
+                thumb = d / "thumb.jpg"
+                img.convert("RGB").save(thumb, quality=85)
+            except Exception as e:
+                print("превью не сделалось:", e)
+                thumb = None
+        send_file("sendVideo", "video", out,
+                  extra={"thumbnail": thumb} if thumb else None,
+                  supports_streaming="true", width=W, height=H, duration=int(dur))
         if cover:
             send_file("sendDocument", "document", cover, caption="Обложка (файлом, без сжатия)")
-        send_file("sendVideo", "video", out, supports_streaming="true",
-                  width=W, height=H, duration=int(dur))
         notify("✅ Готово", final=True)
     except Cancelled:
         try:
