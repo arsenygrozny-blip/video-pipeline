@@ -160,6 +160,34 @@ def fetch_telegram_file(file_id, dst):
     return dst
 
 
+def write_cookies():
+    """Кладём cookies.txt (текст из переменной Render COOKIES_TXT) в /kaggle/working.
+
+    Без них YouTube для серверных IP отвечает «Sign in to confirm you're not a bot».
+    download() ищет файл именно по этому пути.
+    """
+    text = (JOB.get("cookies") or "").strip()  # noqa: F821
+    if not text:
+        print("cookies.txt не задан (COOKIES_TXT пуст) — YouTube может потребовать вход")
+        return
+    p = WORK / "cookies.txt"
+    p.write_text(text + ("" if text.endswith("\n") else "\n"), encoding="utf-8")
+    print(f"cookies.txt записан: {len(text)} байт")
+
+
+def ensure_js_runtime():
+    """yt-dlp для YouTube требует JS-рантайм, и по умолчанию признаёт только deno.
+    node он без явного --js-runtimes не берёт, поэтому ставим deno (best-effort)."""
+    if shutil.which("deno") or Path("/usr/local/bin/deno").exists():
+        return
+    print("Ставлю deno для yt-dlp…")
+    _sh("curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y")
+    if Path("/usr/local/bin/deno").exists():
+        print("deno установлен")
+    else:
+        print("ВНИМАНИЕ: deno не установился, часть форматов YouTube будет недоступна")
+
+
 # ---------------------------- утилиты ----------------------------
 def run(cmd, cwd=None):
     p = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True)
@@ -299,7 +327,8 @@ def download(url, out_dir, tag, audio=False):
                 errors.append(f"{fmt}{' + ' + runtime if runtime else ''}: {str(e)[:110]}")
     raise RuntimeError(
         "Не получилось скачать:\n" + "\n".join(errors[-4:]) + "\n\n"
-        "Если это YouTube и жалуется на вход/403 — положи cookies.txt в /kaggle/working."
+        "Если YouTube пишет «Sign in to confirm you're not a bot» — нужны cookies: "
+        "выгрузи cookies.txt (Netscape) и впиши его текст в переменную COOKIES_TXT на Render."
     )
 
 
@@ -627,6 +656,8 @@ def main():
     try:
         notify("⚙️ Kaggle запустился, готовлюсь…")
         ensure_fonts()
+        write_cookies()
+        ensure_js_runtime()
         FF = pick_ffmpeg()
         banner = None
         if JOB.get("banner_file_id"):  # noqa: F821
