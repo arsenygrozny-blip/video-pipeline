@@ -154,7 +154,7 @@ async def cleanup_flow(chat_id, context, bot):
         try:
             await bot.delete_message(chat_id=chat_id, message_id=mid)
         except Exception as e:
-            print("не удалил сообщение", mid, ":", e)
+            print("не удалил сообщение", mid, ":", e, flush=True)
 
 
 async def start_job(msg, context):
