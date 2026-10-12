@@ -453,6 +453,7 @@ async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = await asyncio.to_thread(_collect)
     except Exception as e:
         body = f"Не получилось: {str(e)[:300]}"
+    print("отчёт по квотам:", body.replace("\n", " | ")[:400])
     header = "📊 Квоты\n\n"
     try:
         await msg.edit_text(header + body)
