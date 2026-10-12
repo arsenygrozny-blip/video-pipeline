@@ -71,7 +71,7 @@ SUB = dict(
 )
 
 # Баннер. colorkey: None или "0x00FF00:0.3:0.1" (вырезать однотонный фон)
-BANNER = dict(pos="top", margin=198, width=1080, colorkey=None)  # 160 + ~2% высоты кадра
+BANNER = dict(pos="top", margin=256, width=1080, colorkey=None)  # 160 + ~5% высоты кадра
 
 # Надпись в начале видео
 SUBSCRIBE = dict(
