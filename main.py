@@ -195,8 +195,6 @@ async def show_ready(msg, job, context):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("АПДЕЙТ текст:", repr(getattr(update.effective_message, "text", None)),
-          "| user:", getattr(update.effective_user, "id", None))
     if not await guard(update):
         return
     msg = update.message
@@ -295,7 +293,6 @@ async def launch(chat_id, job, bot):
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    print("АПДЕЙТ кнопка:", getattr(q, "data", None), "| user:", getattr(update.effective_user, "id", None))
     if not await guard(update):
         return
     try:
@@ -435,7 +432,6 @@ def render_quota_lines():
 
 async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать остаток квот на Kaggle и Render."""
-    print("АПДЕЙТ команда quota | user:", getattr(update.effective_user, "id", None))
     if not await guard(update):
         return
     msg = await update.message.reply_text("📊 Считаю квоты…")
@@ -457,7 +453,7 @@ async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         body = await asyncio.to_thread(_collect)
     except Exception as e:
         body = f"Не получилось: {str(e)[:300]}"
-    print("отчёт по квотам:", body.replace("\n", " | ")[:400])
+    print("отчёт по квотам:", body.replace("\n", " | ")[:400], flush=True)
     header = "📊 Квоты\n\n"
     try:
         await msg.edit_text(header + body)
