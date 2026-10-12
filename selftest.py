@@ -36,7 +36,8 @@ def load_worker(job):
     exec(compile(src, "worker.py", "exec"), ns)
     ns["WORK"] = WORK
     ns["FONT_DIR"] = FONT_DIR
-    for name in ("make_video", "ensure_fonts", "pick_ffmpeg", "make_cover", "make_ass"):
+    for name in ("make_video", "ensure_fonts", "pick_ffmpeg", "make_cover", "make_ass",
+                 "apply_style", "resolve"):
         assert callable(ns[name]), name
     return ns
 
@@ -123,7 +124,7 @@ def main():
         print("аудио:", has_audio or "НЕТ")
 
     frame = WORK / "frame.png"
-    sh(["ffmpeg", "-y", "-ss", "1.0", "-i", out, "-frames:v", "1", frame])
+    sh(["ffmpeg", "-y", "-ss", "1.2", "-i", out, "-frames:v", "1", frame])
     H = 1920
     boxes = {
         "subs": (60, 1020, H - 560 - 130, H - 560 + 130),   # полоса субтитров
@@ -140,6 +141,34 @@ def main():
     csz = Image.open(cover).size
     print("обложка:", csz, f"{cover.stat().st_size / 1024:.0f} КБ")
 
+    # --- стиль "shorts": субтитры по центру кадра, а не снизу ---
+    job_s = dict(job, style="shorts")
+    d2 = WORK / "job_shorts"
+    d2.mkdir(parents=True, exist_ok=True)
+    out_s, _, _ = ns["make_video"](job_s, str(banner), d2)
+    frame_s = WORK / "frame_shorts.png"
+    sh(["ffmpeg", "-y", "-ss", "1.2", "-i", out_s, "-frames:v", "1", frame_s])
+    ps = check_pixels(frame_s, {"center": (340, 740, 860, 1060), "bottom": (60, 1020, 1240, 1420)})
+    shorts_center, shorts_bottom = ps["center"][0], ps["bottom"][0]
+    print(f"стиль shorts: белых по центру={shorts_center}, снизу={shorts_bottom}")
+
+    # --- озвучка и фоны файлом (dict с file_id), а не ссылкой ---
+    src_map = {"AUD": audio, "BG1": bgs[0], "BG2": bgs[1]}
+
+    def fake_fetch(file_id, dst):
+        shutil.copy(src_map[file_id], dst)
+        return Path(dst)
+
+    ns["fetch_telegram_file"] = fake_fetch
+    job_f = {"id": "selftest_files", "audio": {"file_id": "AUD"},
+             "bgs": [{"file_id": "BG1"}, {"file_id": "BG2"}],
+             "cover_text": None, "banner_file_id": None, "style": "lime",
+             "token": "0:SELFTEST", "chat_id": 0, "status_msg": 0}
+    d3 = WORK / "job_files"
+    d3.mkdir(parents=True, exist_ok=True)
+    out_f, _, dur_f = ns["make_video"](job_f, None, d3)
+    print(f"файл-источники: {out_f.name} ({out_f.stat().st_size / 1024:.0f} КБ), длительность {dur_f:.2f} c")
+
     ok = True
     checks = [
         ("видео на месте", out.exists() and out.stat().st_size > 50_000),
@@ -148,6 +177,8 @@ def main():
         ("баннер поверх видео", banner_red > 200),
         ("фон тёмный (кадр 1080x1920)", bg_dark < 40),
         ("обложка 1080x1920", csz == (1080, 1920)),
+        ("стиль shorts: субтитры по центру", shorts_center > 200 and shorts_bottom < 60),
+        ("файл-источники собрались", out_f.exists() and out_f.stat().st_size > 50_000),
     ]
     print()
     for name, good in checks:

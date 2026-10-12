@@ -100,6 +100,38 @@ FONT_URLS = {
 }
 # ===================================================================
 
+SUB_DEFAULT = dict(SUB)  # эталон субтитров, от него отсчитываем каждый стиль
+
+# Готовые стили субтитров. Ключ стиля выбирается в боте кнопкой и приходит в JOB["style"].
+# Значения накладываются поверх SUB (незаданные берутся из дефолта выше).
+SUB_STYLES = {
+    "classic": {},
+    "shorts":  dict(size=104, words=1, align=5, margin_v=0, outline=9, upper=True),
+    "neon":    dict(color="&H0000FFFF", size=94, outline=10, words=2, upper=True),
+    "lime":    dict(color="&H0037FF37", size=90, outline=9, words=2, upper=True),
+    "minimal": dict(size=64, words=4, outline=5, margin_v=520, upper=False),
+}
+STYLE_LABELS = {
+    "classic": "Классика",
+    "shorts": "Shorts",
+    "neon": "Неон",
+    "lime": "Лайм",
+    "minimal": "Минимал",
+}
+
+
+def apply_style(job):
+    """Накладываем выбранный стиль на настройки субтитров (SUB)."""
+    key = (job.get("style") or "classic").strip().lower()
+    preset = SUB_STYLES.get(key)
+    if preset is None:
+        print("неизвестный стиль, беру classic:", key)
+        key, preset = "classic", SUB_STYLES["classic"]
+    SUB.clear()
+    SUB.update(SUB_DEFAULT)
+    SUB.update(preset)
+    print(f"стиль субтитров: {key} ({STYLE_LABELS.get(key, key)}) -> {preset}")
+
 TIME_LIMIT_MIN = int(os.environ.get("JOB_TIMEOUT_MIN", "45"))  # предохранитель, минут
 
 FF = "ffmpeg"
@@ -330,6 +362,16 @@ def download(url, out_dir, tag, audio=False):
         "Если YouTube пишет «Sign in to confirm you're not a bot» — нужны cookies: "
         "выгрузи cookies.txt (Netscape) и впиши его текст в переменную COOKIES_TXT на Render."
     )
+
+
+def resolve(src, out_dir, tag, audio=False):
+    """Источник может быть ссылкой (str) или файлом, присланным в Telegram
+    (dict вида {"file_id": ...}) — тогда тянем его через Bot API."""
+    if isinstance(src, dict) and src.get("file_id"):
+        dst = Path(out_dir) / f"{tag}.upload"
+        print(f"{tag}: файл из Telegram {src['file_id']}")
+        return fetch_telegram_file(src["file_id"], dst)
+    return download(src, out_dir, tag, audio=audio)
 
 
 def normalize(src, dst, dur):
@@ -583,17 +625,18 @@ def assemble(bg, audio, ass, banner, cover, dur, out):
 
 
 def make_video(job, banner, d):
+    apply_style(job)
     notify("⬇️ Скачиваю озвучку…")
-    raw = download(job["audio"], d, "voice", audio=True)
+    raw = resolve(job["audio"], d, "voice", audio=True)
     audio = d / "audio.m4a"
     run([FF, "-y", "-i", raw, "-vn", "-c:a", "aac", "-b:a", "192k", audio])
     dur = duration(audio)
 
     clips = []
     total = len(job["bgs"])
-    for i, url in enumerate(job["bgs"], 1):
+    for i, ref in enumerate(job["bgs"], 1):
         notify(f"⬇️ Фон {i}/{total}: скачиваю и подгоняю под 9:16…")
-        src = download(url, d, f"bg{i}")
+        src = resolve(ref, d, f"bg{i}")
         dst = d / f"norm_{i}.mp4"
         normalize(src, dst, dur)
         clips.append(dst)

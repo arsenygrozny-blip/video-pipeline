@@ -40,6 +40,21 @@ STATE = {"banner": os.environ.get("BANNER_FILE_ID", "")}
 MENU = ReplyKeyboardMarkup([["🎬 Новое видео", "📊 Квоты"]], resize_keyboard=True)
 CANCEL = ("❌ Отмена", "cancel")
 
+# Стили субтитров — ключи совпадают с SUB_STYLES в worker.py.
+STYLES = [
+    ("classic", "Классика"),
+    ("shorts", "Shorts"),
+    ("neon", "Неон"),
+    ("lime", "Лайм"),
+    ("minimal", "Минимал"),
+]
+STYLE_LABELS = dict(STYLES)
+DEFAULT_STYLE = (os.environ.get("STYLE", "classic") or "classic").strip().lower()
+if DEFAULT_STYLE not in STYLE_LABELS:
+    DEFAULT_STYLE = "classic"
+
+MAX_UPLOAD = 20 * 1024 * 1024  # столько Telegram даёт ботам скачивать через Bot API
+
 
 class Busy(Exception):
     pass
@@ -47,6 +62,15 @@ class Busy(Exception):
 
 def kb(*rows):
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=c) for t, c in row] for row in rows])
+
+
+def file_obj(msg):
+    """Достаём вложенный файл из сообщения (аудио, голос, видео, гифка, документ)."""
+    for attr in ("audio", "voice", "video", "video_note", "animation", "document"):
+        obj = getattr(msg, attr, None)
+        if obj is not None:
+            return obj
+    return None
 
 
 # ---------------------------- запуск Kaggle ----------------------------
@@ -159,15 +183,17 @@ async def cleanup_flow(chat_id, context, bot):
 
 async def start_job(msg, context):
     await cleanup_flow(msg.chat_id, context, context.bot)
-    context.user_data["job"] = {"id": uuid.uuid4().hex[:8], "step": "audio", "bgs": []}
+    context.user_data["job"] = {"id": uuid.uuid4().hex[:8], "step": "audio", "bgs": [],
+                                "style": DEFAULT_STYLE}
     _track(context, msg)
-    _track(context, await msg.reply_text("1/4. Пришли ссылку на озвучку.", reply_markup=kb([CANCEL])))
+    _track(context, await msg.reply_text("1/4. Пришли озвучку — ссылкой или файлом (до 20 МБ).",
+                                         reply_markup=kb([CANCEL])))
 
 
 async def ask_bgs(msg, context):
     _track(context, await msg.reply_text(
-        "2/4. Пришли ссылки на фоны: по одной или несколькими сообщениями. "
-        "Они склеятся в том порядке, в котором пришли. Когда хватит, жми «Готово».",
+        "2/4. Пришли фоны — ссылками или файлами (до 20 МБ), по одному или несколькими "
+        "сообщениями. Склеятся в том порядке, в котором пришли. Когда хватит, жми «Готово».",
         reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL])))
 
 
@@ -186,12 +212,25 @@ async def ask_cover(msg, context):
         reply_markup=kb([("⏭ Пропустить", "skip_cover")], [CANCEL])))
 
 
-async def show_ready(msg, job, context):
+def ready_text(job):
     cover = job.get("cover_text")
-    txt = (f"Всё готово к сборке:\n• озвучка: есть\n• фонов: {len(job['bgs'])}\n"
-           f"• баннер: {'да' if job.get('banner_file_id') else 'нет'}\n"
-           f"• обложка: {('«' + cover[:60] + '»') if cover else 'нет'}")
-    _track(context, await msg.reply_text(txt, reply_markup=kb([("🚀 Создать", "create")], [CANCEL])))
+    style = job.get("style", DEFAULT_STYLE)
+    return (f"Всё готово к сборке:\n• озвучка: есть\n• фонов: {len(job['bgs'])}\n"
+            f"• баннер: {'да' if job.get('banner_file_id') else 'нет'}\n"
+            f"• обложка: {('«' + cover[:60] + '»') if cover else 'нет'}\n"
+            f"• стиль: {STYLE_LABELS.get(style, style)}")
+
+
+def ready_kb(job):
+    rows = [[(label, f"style:{key}") for key, label in STYLES[i:i + 2]]
+            for i in range(0, len(STYLES), 2)]
+    rows.append([("🚀 Создать", "create")])
+    rows.append([CANCEL])
+    return kb(*rows)
+
+
+async def show_ready(msg, job, context):
+    _track(context, await msg.reply_text(ready_text(job), reply_markup=ready_kb(job)))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -214,7 +253,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "audio":
         urls = URL_RE.findall(text)
         if not urls:
-            await msg.reply_text("Нужна ссылка (http…).")
+            await msg.reply_text("Нужна ссылка (http…) или пришли файлом (до 20 МБ).")
             return
         job["audio"] = urls[0]
         job["step"] = "bgs"
@@ -222,7 +261,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif step == "bgs":
         urls = URL_RE.findall(text)
         if not urls:
-            await msg.reply_text("Нужна ссылка (http…).")
+            await msg.reply_text("Нужна ссылка (http…) или пришли файлом (до 20 МБ).")
             return
         job["bgs"] += urls
         _track(context, await msg.reply_text(
@@ -243,21 +282,40 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = update.message
     job = context.user_data.get("job")
-    if not job or job["step"] != "banner":
-        await msg.reply_text("Файл сейчас не нужен. Жми «🎬 Новое видео».", reply_markup=MENU)
+    obj = file_obj(msg)
+    if not job:
+        await msg.reply_text("Нажми «🎬 Новое видео».", reply_markup=MENU)
         return
-    obj = msg.video or msg.animation or msg.document
-    if obj.file_size and obj.file_size > 20 * 1024 * 1024:
-        await msg.reply_text("Файл больше 20 МБ, Telegram не даёт ботам его скачать. Сожми баннер и пришли заново.")
+    if obj is None:
+        await msg.reply_text("Не понял, что это за файл. Пришли видео, гифку, аудио или документ.")
         return
-    STATE["banner"] = obj.file_id
-    job["banner_file_id"] = obj.file_id
-    job["step"] = "cover"
+    if obj.file_size and obj.file_size > MAX_UPLOAD:
+        await msg.reply_text("Файл больше 20 МБ — Telegram не даёт ботам такие скачивать. "
+                             "Сожми файл или пришли ссылкой.")
+        return
+    step = job["step"]
     _track(context, msg)
-    _track(context, await msg.reply_text(
-        "Баннер принят. Чтобы он запоминался даже после «сна» сервера, впиши в Render "
-        f"переменную BANNER_FILE_ID:\n{obj.file_id}"))
-    await ask_cover(msg, context)
+    if step == "audio":
+        job["audio"] = {"file_id": obj.file_id}
+        job["step"] = "bgs"
+        _track(context, await msg.reply_text("Озвучка принята (файлом)."))
+        await ask_bgs(msg, context)
+    elif step == "bgs":
+        job["bgs"].append({"file_id": obj.file_id})
+        _track(context, await msg.reply_text(
+            f"Фонов: {len(job['bgs'])}. Ещё файл/ссылку или «Готово».",
+            reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL])))
+    elif step == "banner":
+        STATE["banner"] = obj.file_id
+        job["banner_file_id"] = obj.file_id
+        job["step"] = "cover"
+        _track(context, await msg.reply_text(
+            "Баннер принят. Чтобы он запоминался даже после «сна» сервера, впиши в Render "
+            f"переменную BANNER_FILE_ID:\n{obj.file_id}"))
+        await ask_cover(msg, context)
+    else:
+        await msg.reply_text("Сейчас файл не нужен. Жми «🚀 Создать» или «🎬 Новое видео».",
+                             reply_markup=MENU)
 
 
 async def safe_edit(m, t, markup=None):
@@ -323,6 +381,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not job:
         await msg.reply_text("Это уже неактуально (сервер мог заснуть). Жми «🎬 Новое видео».", reply_markup=MENU)
+        return
+
+    if data.startswith("style:"):
+        key = data.split(":", 1)[1]
+        if key in STYLE_LABELS:
+            job["style"] = key
+        await safe_edit(msg, ready_text(job), ready_kb(job))
         return
 
     if data == "bgs_done":
@@ -487,7 +552,9 @@ def main():
     app.add_handler(CommandHandler("quota", cmd_quota))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.ALL, on_file))
+    file_filter = (filters.AUDIO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE
+                   | filters.ANIMATION | filters.Document.ALL)
+    app.add_handler(MessageHandler(file_filter, on_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
     print(f"Бот запущен (webhook). Ядро на Kaggle: {KAGGLE_USERNAME}/{KERNEL_SLUG}")
