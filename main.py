@@ -6,8 +6,10 @@ import re
 import tempfile
 import traceback
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -19,6 +21,8 @@ BASE_URL = (os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("WEBHOOK_BAS
 KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 COOKIES_TXT = os.environ.get("COOKIES_TXT", "")  # необязательно: cookies.txt для yt-dlp (текстом)
 KERNEL_SLUG = os.environ.get("KERNEL_SLUG", "video-worker")
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")  # чтобы показывать квоты Render
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-db5u35942hec73a7dek0")
 # =======================================================================================================
 
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
@@ -33,7 +37,7 @@ URL_RE = re.compile(r"https?://\S+")
 # зафиксировать переменной BANNER_FILE_ID.
 STATE = {"banner": os.environ.get("BANNER_FILE_ID", "")}
 
-MENU = ReplyKeyboardMarkup([["🎬 Новое видео"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["🎬 Новое видео", "📊 Квоты"]], resize_keyboard=True)
 CANCEL = ("❌ Отмена", "cancel")
 
 
@@ -136,37 +140,58 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готов к работе. Жми «🎬 Новое видео».", reply_markup=MENU)
 
 
+def _track(context, msg):
+    """Запоминаем id сообщений текущего диалога, чтобы потом подчистить чат."""
+    mid = getattr(msg, "message_id", None)
+    if mid:
+        context.user_data.setdefault("flow_msgs", []).append(mid)
+
+
+async def cleanup_flow(chat_id, context, bot):
+    """Удаляем сообщения предыдущего диалога. Свои удаляются всегда, сообщения
+    пользователя — как получится (Telegram не гарантирует это для старых)."""
+    for mid in context.user_data.pop("flow_msgs", []):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception as e:
+            print("не удалил сообщение", mid, ":", e)
+
+
 async def start_job(msg, context):
+    await cleanup_flow(msg.chat_id, context, context.bot)
     context.user_data["job"] = {"id": uuid.uuid4().hex[:8], "step": "audio", "bgs": []}
-    await msg.reply_text("1/4. Пришли ссылку на озвучку.", reply_markup=kb([CANCEL]))
+    _track(context, msg)
+    _track(context, await msg.reply_text("1/4. Пришли ссылку на озвучку.", reply_markup=kb([CANCEL])))
 
 
-async def ask_bgs(msg):
-    await msg.reply_text(
+async def ask_bgs(msg, context):
+    _track(context, await msg.reply_text(
         "2/4. Пришли ссылки на фоны: по одной или несколькими сообщениями. "
         "Они склеятся в том порядке, в котором пришли. Когда хватит, жми «Готово».",
-        reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL]))
+        reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL])))
 
 
-async def ask_banner(msg):
+async def ask_banner(msg, context):
     row = [("⏭ Пропустить", "skip_banner")]
     if STATE["banner"]:
         row.insert(0, ("♻️ Прошлый баннер", "use_banner"))
-    await msg.reply_text("3/4. Пришли баннер файлом (mp4/gif/webm, до 20 МБ) или пропусти.",
-                         reply_markup=kb(row, [CANCEL]))
+    _track(context, await msg.reply_text(
+        "3/4. Пришли баннер файлом (mp4/gif/webm, до 20 МБ) или пропусти.",
+        reply_markup=kb(row, [CANCEL])))
 
 
-async def ask_cover(msg):
-    await msg.reply_text("4/4. Напиши текст обложки или пропусти.",
-                         reply_markup=kb([("⏭ Пропустить", "skip_cover")], [CANCEL]))
+async def ask_cover(msg, context):
+    _track(context, await msg.reply_text(
+        "4/4. Напиши текст обложки или пропусти.",
+        reply_markup=kb([("⏭ Пропустить", "skip_cover")], [CANCEL])))
 
 
-async def show_ready(msg, job):
+async def show_ready(msg, job, context):
     cover = job.get("cover_text")
     txt = (f"Всё готово к сборке:\n• озвучка: есть\n• фонов: {len(job['bgs'])}\n"
            f"• баннер: {'да' if job.get('banner_file_id') else 'нет'}\n"
            f"• обложка: {('«' + cover[:60] + '»') if cover else 'нет'}")
-    await msg.reply_text(txt, reply_markup=kb([("🚀 Создать", "create")], [CANCEL]))
+    _track(context, await msg.reply_text(txt, reply_markup=kb([("🚀 Создать", "create")], [CANCEL])))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -177,10 +202,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🎬 Новое видео":
         await start_job(msg, context)
         return
+    if text == "📊 Квоты":
+        await cmd_quota(update, context)
+        return
     job = context.user_data.get("job")
     if not job:
         await msg.reply_text("Нажми «🎬 Новое видео».", reply_markup=MENU)
         return
+    _track(context, msg)
     step = job["step"]
     if step == "audio":
         urls = URL_RE.findall(text)
@@ -189,19 +218,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         job["audio"] = urls[0]
         job["step"] = "bgs"
-        await ask_bgs(msg)
+        await ask_bgs(msg, context)
     elif step == "bgs":
         urls = URL_RE.findall(text)
         if not urls:
             await msg.reply_text("Нужна ссылка (http…).")
             return
         job["bgs"] += urls
-        await msg.reply_text(f"Фонов: {len(job['bgs'])}. Ещё ссылку или «Готово».",
-                             reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL]))
+        _track(context, await msg.reply_text(
+            f"Фонов: {len(job['bgs'])}. Ещё ссылку или «Готово».",
+            reply_markup=kb([("✅ Готово", "bgs_done")], [CANCEL])))
     elif step == "cover":
         job["cover_text"] = text
         job["step"] = "ready"
-        await show_ready(msg, job)
+        await show_ready(msg, job, context)
     elif step == "banner":
         await msg.reply_text("Тут нужен файл баннера. Отправь его как файл или нажми «Пропустить».")
     else:
@@ -223,10 +253,11 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["banner"] = obj.file_id
     job["banner_file_id"] = obj.file_id
     job["step"] = "cover"
-    await msg.reply_text(
+    _track(context, msg)
+    _track(context, await msg.reply_text(
         "Баннер принят. Чтобы он запоминался даже после «сна» сервера, впиши в Render "
-        f"переменную BANNER_FILE_ID:\n{obj.file_id}")
-    await ask_cover(msg)
+        f"переменную BANNER_FILE_ID:\n{obj.file_id}"))
+    await ask_cover(msg, context)
 
 
 async def safe_edit(m, t, markup=None):
@@ -287,6 +318,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         context.user_data.pop("job", None)
+        await cleanup_flow(msg.chat_id, context, context.bot)
         await msg.reply_text("Отменено.", reply_markup=MENU)
         return
     if not job:
@@ -298,19 +330,20 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("Нужна хотя бы одна ссылка на фон.")
             return
         job["step"] = "banner"
-        await ask_banner(msg)
+        await ask_banner(msg, context)
     elif data == "skip_banner":
         job["step"] = "cover"
-        await ask_cover(msg)
+        await ask_cover(msg, context)
     elif data == "use_banner":
         job["banner_file_id"] = STATE["banner"]
         job["step"] = "cover"
-        await ask_cover(msg)
+        await ask_cover(msg, context)
     elif data == "skip_cover":
         job["step"] = "ready"
-        await show_ready(msg, job)
+        await show_ready(msg, job, context)
     elif data == "create":
         context.user_data.pop("job", None)
+        await cleanup_flow(msg.chat_id, context, context.bot)
         await launch(msg.chat_id, job, context.bot)
 
 
@@ -331,6 +364,100 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
+
+
+# ---------------------------- квоты ----------------------------
+def _fmt_hours(td):
+    secs = int(round(td.total_seconds()))
+    h, m = divmod(secs // 60, 60)
+    return f"{h} ч {m:02d} мин" if h else f"{m} мин"
+
+
+def _fmt_mb(mb):
+    return f"{mb / 1024:.2f} ГБ" if mb >= 1024 else f"{mb:.1f} МБ"
+
+
+def kaggle_quota_lines():
+    """Остаток ускорительной квоты Kaggle (GPU/TPU) и дата сброса."""
+    q = kaggle_api().quota_view()
+    lines = []
+    for tag, attr in (("GPU", "gpu_quota"), ("TPU", "tpu_quota")):
+        acc = getattr(q, attr, None)
+        used = getattr(acc, "time_used", None)
+        total = getattr(acc, "total_time_allowed", None)
+        if used is None or not total or not total.total_seconds():
+            continue
+        left = total - used
+        pct = 100 * left.total_seconds() / total.total_seconds()
+        lines.append(f"🎮 Kaggle {tag}: {_fmt_hours(used)} из {_fmt_hours(total)} "
+                     f"— осталось {_fmt_hours(left)} ({pct:.0f}%)")
+    refresh = getattr(q, "quota_refresh_time", None)
+    if refresh:
+        lines.append(f"🔄 Сброс квоты: {refresh:%d.%m.%Y %H:%M} UTC")
+    return lines
+
+
+def render_quota_lines():
+    """Тариф, статус, последний деплой и трафик сервиса на Render."""
+    if not RENDER_API_KEY:
+        return ["🖥 Render: нет ключа (добавь переменную RENDER_API_KEY)"]
+    h = {"Authorization": f"Bearer {RENDER_API_KEY}"}
+    base = "https://api.render.com/v1"
+    lines = []
+    svc = requests.get(f"{base}/services/{RENDER_SERVICE_ID}", headers=h, timeout=20).json()
+    svc = svc.get("service", svc)
+    det = svc.get("serviceDetails") or {}
+    lines.append(f"🖥 Render: {svc.get('name', '?')} · план {det.get('plan', '?')} · {det.get('region', '?')}")
+    state = "работает" if svc.get("suspended") == "not_suspended" else str(svc.get("suspended"))
+    lines.append(f"• статус: {state}")
+    deps = requests.get(f"{base}/services/{RENDER_SERVICE_ID}/deploys?limit=1", headers=h, timeout=20).json()
+    if deps:
+        dep = deps[0].get("deploy", deps[0])
+        when = str(dep.get("finishedAt") or dep.get("createdAt") or "")[:16].replace("T", " ")
+        lines.append(f"• последний деплой: {dep.get('status')} · {when} UTC")
+    try:
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        m = requests.get(f"{base}/metrics/bandwidth", headers=h, timeout=20, params={
+            "resource": RENDER_SERVICE_ID,
+            "startTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "endTime": now.strftime("%Y-%m-%dT%H:%M:%SZ")}).json()
+        mb = sum(float(pt.get("value") or 0) for series in m for pt in (series.get("values") or []))
+        lines.append(f"• трафик за месяц: {_fmt_mb(mb)} (лимит free ~100 ГБ)")
+    except Exception as e:
+        print("Render bandwidth:", e)
+    lines.append("• free: 750 инстанс-часов/мес, сон через ~15 мин простоя")
+    return lines
+
+
+async def cmd_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать остаток квот на Kaggle и Render."""
+    if not await guard(update):
+        return
+    msg = await update.message.reply_text("📊 Считаю квоты…")
+
+    def _collect():
+        lines = []
+        try:
+            lines += kaggle_quota_lines()
+        except Exception as e:
+            lines.append(f"🎮 Kaggle: не получил ({str(e)[:160]})")
+        lines.append("")
+        try:
+            lines += render_quota_lines()
+        except Exception as e:
+            lines.append(f"🖥 Render: не получил ({str(e)[:160]})")
+        return "\n".join(lines).strip()
+
+    try:
+        body = await asyncio.to_thread(_collect)
+    except Exception as e:
+        body = f"Не получилось: {str(e)[:300]}"
+    header = "📊 Квоты\n\n"
+    try:
+        await msg.edit_text(header + body)
+    except Exception:
+        await update.message.reply_text(header + body)
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -356,6 +483,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("quota", cmd_quota))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.ALL, on_file))
