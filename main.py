@@ -524,7 +524,7 @@ async def cmd_bg_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not BACKGROUNDS:
         await update.message.reply_text(
             "Библиотека фонов пуста.\nПришли ссылку на видео — и она сохранится как фон.",
-            reply_markup=kb([("➕ Добавить фон", "bg_add")]))
+            reply_markup=kb([("➕ Добавить фон", "bg_add")], [("◀️ Назад в меню", "menu_back")]))
         return
     lines = ["📚 Мои фоны:\n"]
     for b in BACKGROUNDS:
@@ -839,7 +839,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "menu_back":
-        await safe_edit(msg, "Главное меню:", MENU)
+        await context.bot.send_message(msg.chat_id, "Главное меню:", reply_markup=MENU)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
         return
 
     if data == "bg_lib_back":
