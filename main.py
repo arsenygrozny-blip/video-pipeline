@@ -28,6 +28,8 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "arsenygrozny-blip/video-pipeline")
 QUEUE_BRANCH = "bot-data"
 QUEUE_FILE = ".queue.json"
+BG_FILE = ".backgrounds.json"
+BG_PREVIEWS_DIR = "bg_previews"
 # =======================================================================================================
 
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
@@ -37,16 +39,21 @@ if not WORKER_FILE.exists():
     raise SystemExit("Рядом с main.py должен лежать worker.py — это код, который запустится на Kaggle")
 WORKER_SRC = WORKER_FILE.read_text(encoding="utf-8")
 URL_RE = re.compile(r"https?://\S+")
+YT_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 STATE = {"banner": os.environ.get("BANNER_FILE_ID", "")}
 
-MENU = ReplyKeyboardMarkup([["🎬 Новое видео", "📊 Квоты"], ["📋 Очередь"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup(
+    [["🎬 Новое видео", "📊 Квоты"], ["📋 Очередь", "📚 Мои фоны"]],
+    resize_keyboard=True,
+)
 CANCEL = ("❌ Отмена", "cancel")
 
-# ---------------------------- очередь заданий ----------------------------
-QUEUE = []
+# ---------------------------- очереди и базы ----------------------------
+QUEUE = []          # [{"job": {...}, "chat_id": int}]
+BACKGROUNDS = []    # [{"id", "url", "name", "end_time", "preview_id", "added_at"}]
 PROCESSING = False
-RUNNING = False  # запущена ли обработка очереди
+RUNNING = False
 
 STYLES = [
     ("classic", "Классика"),
@@ -62,7 +69,6 @@ if DEFAULT_STYLE not in STYLE_LABELS:
 
 MAX_UPLOAD = 20 * 1024 * 1024
 
-# Шаги диалога для навигации «Назад»
 STEP_ORDER = ["audio", "bgs", "banner", "cover", "ready"]
 
 
@@ -82,7 +88,7 @@ def file_obj(msg):
     return None
 
 
-# ---------------------------- очередь: сохранение в GitHub ----------------------------
+# ---------------------------- GitHub helpers ----------------------------
 def _gh_headers():
     return {
         "Authorization": f"token {GITHUB_TOKEN}",
@@ -91,70 +97,232 @@ def _gh_headers():
     }
 
 
+def _gh_get(path, params=None):
+    r = requests.get(
+        f"https://api.github.com/repos/{GITHUB_REPO}/{path}",
+        headers=_gh_headers(), params=params, timeout=15)
+    return r
+
+
+def _gh_put(path, body):
+    return requests.put(
+        f"https://api.github.com/repos/{GITHUB_REPO}/{path}",
+        headers=_gh_headers(), json=body, timeout=15)
+
+
+def _gh_delete(path):
+    return requests.delete(
+        f"https://api.github.com/repos/{GITHUB_REPO}/{path}",
+        headers=_gh_headers(), timeout=15)
+
+
+def _ensure_branch():
+    """Создаёт ветку bot-data от main, если её нет."""
+    r = _gh_get(f"git/ref/heads/{QUEUE_BRANCH}")
+    if r.ok:
+        return True
+    r2 = _gh_get("git/ref/heads/main")
+    if not r2.ok:
+        return False
+    main_sha = r2.json()["object"]["sha"]
+    r3 = requests.post(
+        f"https://api.github.com/repos/{GITHUB_REPO}/git/refs",
+        headers=_gh_headers(),
+        json={"ref": f"refs/heads/{QUEUE_BRANCH}", "sha": main_sha},
+        timeout=15)
+    return r3.ok or r3.status_code == 422
+
+
+def _gh_file_sha(path):
+    r = _gh_get(f"contents/{path}?ref={QUEUE_BRANCH}")
+    if r.ok:
+        return r.json().get("sha")
+    return None
+
+
+def _gh_write_file(path, data_bytes, message):
+    """Записывает/перезаписывает файл на ветке bot-data."""
+    if not GITHUB_TOKEN:
+        return False
+    _ensure_branch()
+    sha = _gh_file_sha(path)
+    content = base64.b64encode(data_bytes).decode()
+    body = {"message": message, "content": content, "branch": QUEUE_BRANCH}
+    if sha:
+        body["sha"] = sha
+    r = _gh_put(f"contents/{path}", body)
+    return r.status_code in (200, 201)
+
+
+def _gh_read_file(path):
+    if not GITHUB_TOKEN:
+        return None
+    _ensure_branch()
+    r = _gh_get(f"contents/{path}?ref={QUEUE_BRANCH}")
+    if not r.ok:
+        return None
+    try:
+        return base64.b64decode(r.json()["content"]).decode()
+    except Exception:
+        return None
+
+
+def _gh_delete_file(path):
+    if not GITHUB_TOKEN:
+        return False
+    _ensure_branch()
+    sha = _gh_file_sha(path)
+    if not sha:
+        return True
+    body = {"message": f"delete {path}", "sha": sha, "branch": QUEUE_BRANCH}
+    r = _gh_delete(f"contents/{path}")
+    return r.status_code in (200, 204)
+
+
+# ---------------------------- очередь ----------------------------
 def queue_save():
-    """Сохраняем очередь в GitHub (ветка bot-data), чтобы пережить «сон» Render."""
     if not GITHUB_TOKEN:
         return
     try:
         data = json.dumps({"queue": QUEUE, "running": RUNNING}, ensure_ascii=False)
-        content = base64.b64encode(data.encode()).decode()
-
-        # Узнаём текущий sha файла (если есть)
-        sha = None
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{QUEUE_FILE}?ref={QUEUE_BRANCH}",
-            headers=_gh_headers(), timeout=15)
-        if r.ok:
-            sha = r.json().get("sha")
-
-        body = {"message": f"queue update {datetime.now(timezone.utc):%H:%M:%S}",
-                "content": content, "branch": QUEUE_BRANCH}
-        if sha:
-            body["sha"] = sha
-
-        # Если ветки нет — создаём через первый коммит
-        r2 = requests.put(
-            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{QUEUE_FILE}",
-            headers=_gh_headers(), json=body, timeout=15)
-        if r2.status_code == 422 and "Branch" in r2.text:
-            # ветки нет — пробуем через reference
-            r3 = requests.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/git/ref/heads/main",
-                headers=_gh_headers(), timeout=15)
-            if r3.ok:
-                main_sha = r3.json()["object"]["sha"]
-                requests.post(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/git/refs",
-                    headers=_gh_headers(),
-                    json={"ref": f"refs/heads/{QUEUE_BRANCH}", "sha": main_sha},
-                    timeout=15)
-                requests.put(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/contents/{QUEUE_FILE}",
-                    headers=_gh_headers(), json=body, timeout=15)
-        print(f"queue_save: {len(QUEUE)} заданий, status={r2.status_code}", flush=True)
+        _gh_write_file(QUEUE_FILE, data.encode(), f"queue update {len(QUEUE)}")
     except Exception as e:
         print("queue_save error:", e, flush=True)
 
 
 def queue_load():
-    """Загружаем очередь из GitHub при старте."""
     global QUEUE, RUNNING
     if not GITHUB_TOKEN:
         return
     try:
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{QUEUE_FILE}?ref={QUEUE_BRANCH}",
-            headers=_gh_headers(), timeout=15)
-        if not r.ok:
-            print("queue_load: файла нет", flush=True)
+        raw = _gh_read_file(QUEUE_FILE)
+        if raw is None:
             return
-        raw = base64.b64decode(r.json()["content"]).decode()
         data = json.loads(raw)
         QUEUE[:] = data.get("queue", [])
         RUNNING = data.get("running", False)
         print(f"queue_load: {len(QUEUE)} заданий, running={RUNNING}", flush=True)
     except Exception as e:
         print("queue_load error:", e, flush=True)
+
+
+# ---------------------------- база фонов ----------------------------
+def backgrounds_save():
+    if not GITHUB_TOKEN:
+        return
+    try:
+        data = json.dumps({"backgrounds": BACKGROUNDS}, ensure_ascii=False, indent=2)
+        _gh_write_file(BG_FILE, data.encode(), f"backgrounds update {len(BACKGROUNDS)}")
+    except Exception as e:
+        print("backgrounds_save error:", e, flush=True)
+
+
+def backgrounds_load():
+    global BACKGROUNDS
+    if not GITHUB_TOKEN:
+        return
+    try:
+        raw = _gh_read_file(BG_FILE)
+        if raw is None:
+            print("backgrounds_load: файла нет", flush=True)
+            return
+        data = json.loads(raw)
+        BACKGROUNDS[:] = data.get("backgrounds", [])
+        print(f"backgrounds_load: {len(BACKGROUNDS)} фонов", flush=True)
+    except Exception as e:
+        print("backgrounds_load error:", e, flush=True)
+
+
+def backgrounds_preview_path(bg_id):
+    return f"{BG_PREVIEWS_DIR}/{bg_id}.jpg"
+
+
+def backgrounds_save_preview(bg_id, image_bytes):
+    if not GITHUB_TOKEN:
+        return False
+    return _gh_write_file(backgrounds_preview_path(bg_id), image_bytes, f"preview {bg_id}")
+
+
+def backgrounds_delete_preview(bg_id):
+    if not GITHUB_TOKEN:
+        return
+    _gh_delete_file(backgrounds_preview_path(bg_id))
+
+
+def backgrounds_add(url, name, end_time=None, preview_bytes=None):
+    bg_id = "bg_" + uuid.uuid4().hex[:12]
+    if preview_bytes:
+        backgrounds_save_preview(bg_id, preview_bytes)
+    BACKGROUNDS.append({
+        "id": bg_id,
+        "url": url,
+        "name": name or url,
+        "end_time": end_time,
+        "preview_id": bg_id if preview_bytes else None,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    })
+    backgrounds_save()
+    return bg_id
+
+
+def backgrounds_remove(bg_id):
+    global BACKGROUNDS
+    BACKGROUNDS = [b for b in BACKGROUNDS if b["id"] != bg_id]
+    backgrounds_delete_preview(bg_id)
+    backgrounds_save()
+
+
+def find_background(bg_id):
+    for b in BACKGROUNDS:
+        if b["id"] == bg_id:
+            return b
+    return None
+
+
+# ---------------------------- превью фона ----------------------------
+def _youtube_video_id(url):
+    m = YT_RE.search(url)
+    return m.group(1) if m else None
+
+
+def extract_preview(url):
+    """Возвращает (image_bytes или None, превью_url или None)."""
+    yt_id = _youtube_video_id(url)
+    if yt_id:
+        # Пробуем maxresdefault, потом hqdefault
+        for fmt in ("maxresdefault", "hqdefault", "mqdefault"):
+            preview_url = f"https://img.youtube.com/vi/{yt_id}/{fmt}.jpg"
+            try:
+                r = requests.get(preview_url, timeout=15)
+                if r.ok and r.content and len(r.content) > 1000:
+                    return r.content, preview_url
+            except Exception:
+                pass
+        return None, f"https://img.youtube.com/vi/{yt_id}/hqdefault.jpg"
+    # Для не-Youtube: скачиваем первый кадр через ffmpeg
+    try:
+        tmp = Path(tempfile.mkdtemp()) / "preview.mp4"
+        # Пробуем скачать через yt-dlp
+        import yt_dlp
+        ydl_opts = {
+            "outtmpl": str(tmp),
+            "quiet": True,
+            "noplaylist": True,
+            "format": "worst",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        # Берём первый кадр
+        out_img = Path(tempfile.mkdtemp()) / "frame.jpg"
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(tmp), "-vframes", "1", str(out_img)],
+            capture_output=True, timeout=60)
+        if out_img.exists():
+            return out_img.read_bytes(), None
+    except Exception as e:
+        print("preview extract error:", e, flush=True)
+    return None, None
 
 
 # ---------------------------- запуск Kaggle ----------------------------
@@ -171,19 +339,29 @@ def kaggle_api():
     return api
 
 
-def kaggle_run(job):
+def kaggle_run(job, max_retries=4):
+    """Запуск на Kaggle с повтором при Busy (вариант А)."""
     api = kaggle_api()
     slug = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
 
-    try:
-        st = api.kernels_status(slug)
-        status = str(getattr(st, "status", st)).lower()
-        if "running" in status or "queued" in status:
-            raise Busy()
-    except Busy:
-        raise
-    except Exception:
-        pass
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            st = api.kernels_status(slug)
+            status = str(getattr(st, "status", st)).lower()
+            if "running" in status or "queued" in status:
+                raise Busy()
+        except Busy:
+            last_err = "Kaggle занят"
+            if attempt < max_retries - 1:
+                import asyncio
+                import time
+                time.sleep(15 * (attempt + 1))
+                continue
+            raise
+        except Exception:
+            pass  # ядра ещё нет, первый запуск
+        break
 
     d = Path(tempfile.mkdtemp())
     script = "import json\nJOB = json.loads(" + repr(json.dumps(job, ensure_ascii=False)) + ")\n" + WORKER_SRC
@@ -209,23 +387,12 @@ def kaggle_run(job):
 
 
 def kaggle_prune():
-    """Удаляем старые версии кернела, оставляем последние 3."""
     try:
-        api = kaggle_api()
-        slug = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
-        versions = api.kernels_list(user=KAGGLE_USERNAME)
-        # kernels_list возвращает ядра, а не версии. Через kernel_version_list:
-        vers = api.kernel_output_files  # noqa — заглушка
-        # Пробуем kernels_status → нет версий. Используем прямой API:
-        import kaggle.api.kaggle_api_extended as kext
-        kv = getattr(api, "kernels_list_output_files", None)
-        # Альтернатива: просто чистим через kernels_push с тем же slug — он перезаписывает.
-        # Для удаления старых версий используем API:
         r = requests.delete(
             f"https://www.kaggle.com/api/v1/kernels/{KAGGLE_USERNAME}/{KERNEL_SLUG}/output",
             auth=(KAGGLE_USERNAME, os.environ.get("KAGGLE_KEY", "")),
             timeout=15)
-        print(f"kaggle_prune output cleanup: {r.status_code}", flush=True)
+        print(f"kaggle_prune: {r.status_code}", flush=True)
     except Exception as e:
         print("kaggle_prune:", e, flush=True)
 
@@ -280,7 +447,6 @@ async def cleanup_flow(chat_id, context, bot):
 
 
 def _back_row(job):
-    """Кнопка «Назад» — возвращает на предыдущий шаг."""
     step = job.get("step", "audio")
     if step in ("bgs", "banner", "cover", "ready"):
         return [("◀️ Назад", "back")]
@@ -299,7 +465,11 @@ async def start_job(msg, context):
 
 async def ask_bgs(msg, context):
     job = context.user_data["job"]
-    rows = _back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]
+    rows = []
+    if BACKGROUNDS:
+        rows.append([("📚 Мои фоны", "bg_library")])
+        rows.append([("🎲 Случайный фон", "bg_random")])
+    rows += _back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]
     _track(context, await msg.reply_text(
         "2/5. Пришли фоны — ссылками или файлами. Склеятся по порядку. Жми «Готово» когда хватит.",
         reply_markup=kb(rows)))
@@ -346,12 +516,96 @@ async def show_ready(msg, job, context):
     _track(context, await msg.reply_text(ready_text(job), reply_markup=ready_kb(job)))
 
 
+# ---------------------------- библиотека фонов ----------------------------
+async def cmd_bg_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать сохранённые фоны с превью."""
+    if not await guard(update):
+        return
+    if not BACKGROUNDS:
+        await update.message.reply_text(
+            "Библиотека фонов пуста.\nПришли ссылку на видео — и она сохранится как фон.",
+            reply_markup=kb([("➕ Добавить фон", "bg_add")]))
+        return
+    lines = ["📚 Мои фоны:\n"]
+    for b in BACKGROUNDS:
+        lines.append(f"• {b['name']}\n  {b['url'][:60]}")
+    text = "\n".join(lines)
+    kb_markup = kb(
+        [("➕ Добавить фон", "bg_add")],
+        [("🗑 Удалить фон", "bg_delete")],
+        [("◀️ Назад в меню", "menu_back")],
+    )
+    await update.message.reply_text(text, reply_markup=kb_markup)
+
+
+async def cmd_bg_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать добавление фона: просим ссылку."""
+    if not await guard(update):
+        return
+    context.user_data["bg_flow"] = {"step": "url"}
+    await update.message.reply_text(
+        "Пришли ссылку на видео (YouTube или прямая ссылка).",
+        reply_markup=kb([CANCEL]))
+
+
+async def cmd_bg_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Удаление фона — показываем список с кнопками удалить."""
+    if not await guard(update):
+        return
+    if not BACKGROUNDS:
+        await update.message.reply_text("Библиотека пуста.")
+        return
+    rows = []
+    for b in BACKGROUNDS:
+        rows.append([(f"🗑 {b['name'][:30]}", f"bg_del_{b['id']}")])
+    rows.append([("◀️ Назад", "bg_lib_back")])
+    await update.message.reply_text("Выбери фон для удаления:", reply_markup=kb(*rows))
+
+
 # ---------------------------- приём данных ----------------------------
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
     msg = update.message
     text = (msg.text or "").strip()
+
+    # Фоновый поток добавления
+    bg_flow = context.user_data.get("bg_flow")
+    if bg_flow:
+        if bg_flow["step"] == "url":
+            urls = URL_RE.findall(text)
+            if not urls:
+                await msg.reply_text("Нужна ссылка (http…).")
+                return
+            url = urls[0]
+            context.user_data["bg_flow"]["url"] = url
+            context.user_data["bg_flow"]["step"] = "name"
+            # Извлекаем превью
+            preview_bytes, preview_url = extract_preview(url)
+            if preview_bytes:
+                context.user_data["bg_flow"]["preview_bytes"] = preview_bytes
+                await msg.reply_photo(
+                    photo=preview_bytes,
+                    caption="Превью фонового видео. Пришли имя для фон (или «пропусти»).",
+                    reply_markup=kb([("⏭ Пропустить", "bg_name_skip"), CANCEL]))
+            else:
+                await msg.reply_text(
+                    "Превью не извлеклось (не YouTube и не скачалось).\n"
+                    "Пришли имя для фон (или «пропусти»).",
+                    reply_markup=kb([("⏭ Пропустить", "bg_name_skip"), CANCEL]))
+            return
+        elif bg_flow["step"] == "name":
+            name = None if text == "пропусти" else text
+            url = bg_flow["url"]
+            preview_bytes = bg_flow.get("preview_bytes")
+            end_time = None
+            bg_id = backgrounds_add(url, name, end_time=end_time, preview_bytes=preview_bytes)
+            context.user_data.pop("bg_flow", None)
+            await msg.reply_text(
+                f"✅ Фон сохранён: {name or url}\nID: {bg_id}",
+                reply_markup=MENU)
+            return
+
     if text == "🎬 Новое видео":
         await start_job(msg, context)
         return
@@ -360,6 +614,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "📋 Очередь":
         await cmd_queue(update, context)
+        return
+    if text == "📚 Мои фоны":
+        await cmd_bg_library(update, context)
         return
     job = context.user_data.get("job")
     if not job:
@@ -454,7 +711,6 @@ async def launch(chat_id, job, bot):
         await asyncio.to_thread(kaggle_run, job)
         await safe_edit(status, "⏳ Задание ушло. Старт ~несколько минут, дальше статусы и видео.",
                         kb([("🛑 Отменить", "cancel_run")]))
-        # После запуска чистим старые версии кернела
         asyncio.get_event_loop().call_later(5, lambda: asyncio.ensure_future(
             asyncio.to_thread(kaggle_prune)))
     except Busy:
@@ -538,6 +794,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = q.message
     job = context.user_data.get("job")
 
+    # Фоновый поток
+    bg_flow = context.user_data.get("bg_flow")
+    if bg_flow and data == "bg_name_skip":
+        context.user_data["bg_flow"]["name"] = None
+        context.user_data["bg_flow"]["step"] = "name"
+        await msg.edit_caption("Пришли имя для фон (или «пропусти»).")
+        return
+
     if data == "cancel_run":
         try:
             await msg.delete()
@@ -549,6 +813,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "cancel":
         context.user_data.pop("job", None)
+        context.user_data.pop("bg_flow", None)
         await cleanup_flow(msg.chat_id, context, context.bot)
         await msg.reply_text("Отменено.", reply_markup=MENU)
         return
@@ -573,36 +838,54 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(msg, "⏸ Пауза. Очередь сохранена.", queue_kb())
         return
 
-    if data == "back":
-        if not job:
-            await msg.reply_text("Нечего откатывать.", reply_markup=MENU)
+    if data == "menu_back":
+        await safe_edit(msg, "Главное меню:", MENU)
+        return
+
+    if data == "bg_lib_back":
+        await cmd_bg_library(update, context)
+        return
+
+    if data == "bg_add":
+        context.user_data["bg_flow"] = {"step": "url"}
+        await safe_edit(msg, "Пришли ссылку на видео (YouTube или прямая ссылка).", kb([CANCEL]))
+        return
+
+    if data == "bg_delete":
+        await cmd_bg_delete(update, context)
+        return
+
+    if data.startswith("bg_del_"):
+        bg_id = data[len("bg_del_"):]
+        backgrounds_remove(bg_id)
+        await safe_edit(msg, f"🗑 Фон удалён.")
+        await cmd_bg_delete(update, context)
+        return
+
+    if data == "bg_library":
+        await cmd_bg_library(update, context)
+        return
+
+    if data == "bg_random":
+        if not BACKGROUNDS:
+            await msg.reply_text("Библиотека фонов пуста.")
             return
-        step = job.get("step", "audio")
-        idx = STEP_ORDER.index(step) if step in STEP_ORDER else 0
-        if idx > 0:
-            job["step"] = STEP_ORDER[idx - 1]
-        prev = job["step"]
-        if prev == "audio":
-            await cleanup_flow(msg.chat_id, context, context.bot)
-            _track(context, msg)
-            _track(context, await msg.reply_text(
-                "1/5. Пришли озвучку (ссылкой или файлом).",
-                reply_markup=kb([CANCEL])))
-        elif prev == "bgs":
-            await cleanup_flow(msg.chat_id, context, context.bot)
-            _track(context, msg)
-            job["step"] = "bgs"
-            await ask_bgs(msg, context)
-        elif prev == "banner":
-            job["step"] = "banner"
-            await cleanup_flow(msg.chat_id, context, context.bot)
-            _track(context, msg)
-            await ask_banner(msg, context)
-        elif prev == "cover":
-            job["step"] = "cover"
-            await cleanup_flow(msg.chat_id, context, context.bot)
-            _track(context, msg)
-            await ask_cover(msg, context)
+        import random
+        bg = random.choice(BACKGROUNDS)
+        job.setdefault("bgs", []).append({
+            "url": bg["url"],
+            "name": bg["name"],
+            "source": "library",
+            "bg_id": bg["id"],
+            "end_time": bg.get("end_time"),
+        })
+        await safe_edit(msg, f"✅ Добавлен случайный фон: {bg['name']}")
+        return
+
+    if data == "cancel_run":
+        return
+
+    if data == "cancel":
         return
 
     if not job:
@@ -634,6 +917,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_ready(msg, job, context)
     elif data == "create":
         context.user_data.pop("job", None)
+        context.user_data.pop("bg_flow", None)
         await cleanup_flow(msg.chat_id, context, context.bot)
         QUEUE.append({"job": job, "chat_id": msg.chat_id})
         queue_save()
@@ -777,10 +1061,11 @@ def main():
     if not BASE_URL:
         raise SystemExit("Нет RENDER_EXTERNAL_URL")
     if not GITHUB_TOKEN:
-        print("ВНИМАНИЕ: нет GITHUB_TOKEN — очередь не переживёт сон Render", flush=True)
+        print("ВНИМАНИЕ: нет GITHUB_TOKEN — очередь и библиотека не переживут сон Render", flush=True)
 
     async def _post_init(app):
         await asyncio.to_thread(queue_load)
+        await asyncio.to_thread(backgrounds_load)
         app.create_task(queue_worker(app))
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()

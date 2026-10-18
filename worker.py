@@ -1,7 +1,9 @@
 # ВНИМАНИЕ: перед этим файлом бот на Render дописывает строку JOB = json.loads(...)
 # с заданием (ссылки, текст обложки, chat_id и т.д.). Здесь JOB уже существует.
 import json
+import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -366,19 +368,60 @@ def download(url, out_dir, tag, audio=False):
 
 def resolve(src, out_dir, tag, audio=False):
     """Источник может быть ссылкой (str) или файлом, присланным в Telegram
-    (dict вида {"file_id": ...}) — тогда тянем его через Bot API."""
-    if isinstance(src, dict) and src.get("file_id"):
-        dst = Path(out_dir) / f"{tag}.upload"
-        print(f"{tag}: файл из Telegram {src['file_id']}")
-        return fetch_telegram_file(src["file_id"], dst)
+    (dict вида {"file_id": ...}) — тогда тянем его через Bot API.
+    Также поддерживает dict из библиотеки фонов: {"url": ..., "name": ..., ...}."""
+    if isinstance(src, dict):
+        if src.get("file_id"):
+            dst = Path(out_dir) / f"{tag}.upload"
+            print(f"{tag}: файл из Telegram {src['file_id']}")
+            return fetch_telegram_file(src["file_id"], dst)
+        if src.get("url"):
+            return download(src["url"], out_dir, tag, audio=audio)
     return download(src, out_dir, tag, audio=audio)
 
 
-def normalize(src, dst, dur):
-    vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
-          f"setsar=1,fps={FPS},format=yuv420p")
-    run([FF, "-y", "-i", src, "-an", "-t", f"{dur + 1:.2f}", "-vf", vf,
-         "-c:v", "libx264", "-preset", PRESET, "-crf", "20", dst])
+def normalize(src, dst, dur, start_time=None, end_time=None, loop=True):
+    """Нормализует фон под 9:16.
+    
+    start_time — секунда старта в исходном фоне (None = случайная, если фон длиннее dur)
+    end_time   — конец обрезки (None = до конца файла)
+    loop       — зацикливать, если фон короче dur
+    """
+    bg_dur = duration(src)
+
+    # Определяем стартовую точку
+    if start_time is None:
+        if bg_dur > dur:
+            start_time = random.uniform(0, max(0, bg_dur - dur))
+        else:
+            start_time = 0.0
+
+    # Определяем конец сегмента
+    seg_end = min(start_time + dur, bg_dur)
+    if end_time is not None:
+        seg_end = min(seg_end, end_time)
+    seg_dur = max(seg_end - start_time, 0.1)
+
+    # Извлекаем сегмент
+    segment = dst.parent / f"{dst.stem}_seg.mp4"
+    run([FF, "-y", "-ss", f"{start_time:.3f}", "-i", src, "-t", f"{seg_dur:.3f}",
+         "-an", "-c", "copy", segment])
+
+    if seg_dur >= dur:
+        # Сегмента хватает — просто копируем с обрезкой по dur
+        run([FF, "-y", "-i", segment, "-an", "-t", f"{dur + 1:.2f}", "-c", "copy", dst])
+    elif loop:
+        # Фон короче видео — зацикливаем сегмент
+        loops = math.ceil(dur / seg_dur)
+        lst = dst.parent / f"{dst.stem}_loop.txt"
+        lst.write_text("".join(f"file '{segment.resolve()}'\n" for _ in range(loops)))
+        run([FF, "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy",
+             "-t", f"{dur + 1:.2f}", dst])
+        lst.unlink(missing_ok=True)
+    else:
+        run([FF, "-y", "-i", segment, "-an", "-t", f"{dur + 1:.2f}", "-c", "copy", dst])
+
+    segment.unlink(missing_ok=True)
 
 
 def concat(clips, dst):
@@ -636,9 +679,14 @@ def make_video(job, banner, d):
     total = len(job["bgs"])
     for i, ref in enumerate(job["bgs"], 1):
         notify(f"⬇️ Фон {i}/{total}: скачиваю и подгоняю под 9:16…")
+        # Извлекаем метаданные фона из библиотеки (если dict)
+        bg_start = None
+        bg_end = None
+        if isinstance(ref, dict):
+            bg_end = ref.get("end_time")
         src = resolve(ref, d, f"bg{i}")
         dst = d / f"norm_{i}.mp4"
-        normalize(src, dst, dur)
+        normalize(src, dst, dur, start_time=bg_start, end_time=bg_end)
         clips.append(dst)
 
     bg = d / "bg.mp4"
