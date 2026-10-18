@@ -22,7 +22,7 @@ KAGGLE_USERNAME = os.environ.get("KAGGLE_USERNAME", "")
 COOKIES_TXT = os.environ.get("COOKIES_TXT", "")  # необязательно: cookies.txt для yt-dlp (текстом)
 KERNEL_SLUG = os.environ.get("KERNEL_SLUG", "video-worker")
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")  # чтобы показывать квоты Render
-RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-db5u35942hec73a7dek0")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "srv-dbabnujrjlhs739lmlf0")
 # =======================================================================================================
 
 SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
@@ -37,8 +37,14 @@ URL_RE = re.compile(r"https?://\S+")
 # зафиксировать переменной BANNER_FILE_ID.
 STATE = {"banner": os.environ.get("BANNER_FILE_ID", "")}
 
-MENU = ReplyKeyboardMarkup([["🎬 Новое видео", "📊 Квоты"]], resize_keyboard=True)
+MENU = ReplyKeyboardMarkup([["🎬 Новое видео", "📊 Квоты"], ["📋 Очередь"]], resize_keyboard=True)
 CANCEL = ("❌ Отмена", "cancel")
+
+# ---------------------------- очередь заданий ----------------------------
+# В очереди лежат только метаданные (ссылки, file_id), не сами файлы —
+# поэтому память Render free не страдает. Файлы качаются на Kaggle.
+QUEUE = []          # [{"job": {...}, "chat_id": int}]
+PROCESSING = False  # идёт ли сейчас обработка на Kaggle
 
 # Стили субтитров — ключи совпадают с SUB_STYLES в worker.py.
 STYLES = [
@@ -244,6 +250,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📊 Квоты":
         await cmd_quota(update, context)
         return
+    if text == "📋 Очередь":
+        await cmd_queue(update, context)
+        return
     job = context.user_data.get("job")
     if not job:
         await msg.reply_text("Нажми «🎬 Новое видео».", reply_markup=MENU)
@@ -349,6 +358,48 @@ async def launch(chat_id, job, bot):
         await safe_edit(status, f"❌ Не удалось запустить Kaggle:\n{str(e)[-700:]}")
 
 
+# ---------------------------- обработчик очереди ----------------------------
+async def queue_worker(app):
+    """Фоновая задача: берёт задания из очереди и запускает на Kaggle по одному."""
+    global PROCESSING
+    while True:
+        await asyncio.sleep(8)
+        if PROCESSING or not QUEUE:
+            continue
+        PROCESSING = True
+        item = QUEUE.pop(0)
+        chat_id = item["chat_id"]
+        job = item["job"]
+        try:
+            n_left = len(QUEUE)
+            prefix = f"📋 В очереди осталось: {n_left}\n" if n_left else ""
+            await app.bot.send_message(chat_id, prefix + "🎬 Запускаю следующее видео…")
+            await launch(chat_id, job, app.bot)
+        except Exception as e:
+            print("QUEUE WORKER ERROR:", e, flush=True)
+            try:
+                await app.bot.send_message(chat_id, f"❌ Ошибка очереди: {str(e)[:200]}")
+            except Exception:
+                pass
+        finally:
+            PROCESSING = False
+
+
+def queue_snapshot():
+    """Краткая сводка по очереди для отображения."""
+    lines = []
+    if PROCESSING:
+        lines.append("⏳ Сейчас обрабатывается видео на Kaggle")
+    for i, item in enumerate(QUEUE, 1):
+        j = item["job"]
+        style = j.get("style", DEFAULT_STYLE)
+        n_bgs = len(j.get("bgs", []))
+        lines.append(f"{i}. стиль: {STYLE_LABELS.get(style, style)}, фонов: {n_bgs}")
+    if not lines:
+        lines.append("Очередь пуста.")
+    return "\n".join(lines)
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not await guard(update):
@@ -379,6 +430,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cleanup_flow(msg.chat_id, context, context.bot)
         await msg.reply_text("Отменено.", reply_markup=MENU)
         return
+
+    if data == "queue_clear":
+        n = len(QUEUE)
+        QUEUE.clear()
+        await safe_edit(msg, f"🗑 Очередь очищена ({n} заданий удалено).")
+        return
+
     if not job:
         await msg.reply_text("Это уже неактуально (сервер мог заснуть). Жми «🎬 Новое видео».", reply_markup=MENU)
         return
@@ -409,7 +467,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "create":
         context.user_data.pop("job", None)
         await cleanup_flow(msg.chat_id, context, context.bot)
-        await launch(msg.chat_id, job, context.bot)
+        QUEUE.append({"job": job, "chat_id": msg.chat_id})
+        pos = len(QUEUE)
+        if PROCESSING or pos > 1:
+            await context.bot.send_message(
+                msg.chat_id,
+                f"✅ Добавлено в очередь (позиция {pos}).\n"
+                f"В очереди: {pos} видео. Обработка идёт по порядку.")
+        else:
+            await context.bot.send_message(
+                msg.chat_id,
+                "✅ Добавлено в очередь. Запускаю обработку…")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,6 +497,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Твой Telegram ID: {update.effective_user.id}")
+
+
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать очередь и предложить очистить."""
+    if not await guard(update):
+        return
+    text = "📋 Очередь:\n\n" + queue_snapshot()
+    if QUEUE or PROCESSING:
+        rows = [("🗑 Очистить очередь", "queue_clear")]
+    else:
+        rows = []
+    await update.message.reply_text(text, reply_markup=kb(rows) if rows else None)
 
 
 # ---------------------------- квоты ----------------------------
@@ -546,10 +626,15 @@ def main():
     missing = [k for k in ("KAGGLE_USERNAME", "KAGGLE_KEY") if not os.environ.get(k)]
     if missing:
         print("ВНИМАНИЕ: не заданы " + ", ".join(missing) + " — задания не будут уходить на Kaggle")
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    async def _post_init(app):
+        app.create_task(queue_worker(app))
+
+    app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("quota", cmd_quota))
+    app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CallbackQueryHandler(on_button))
     file_filter = (filters.AUDIO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE
