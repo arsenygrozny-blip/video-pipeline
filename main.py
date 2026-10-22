@@ -362,6 +362,13 @@ def kaggle_api():
     return api
 
 
+def kaggle_busy():
+    api = kaggle_api()
+    st = api.kernels_status(f"{KAGGLE_USERNAME}/{KERNEL_SLUG}")
+    s = str(getattr(st, "status", st)).lower()
+    return "running" in s or "queued" in s
+
+
 def kaggle_run(job, max_retries=4):
     """Запуск на Kaggle с повтором при Busy (вариант А)."""
     api = kaggle_api()
@@ -747,7 +754,8 @@ async def launch(chat_id, job, bot):
         asyncio.get_event_loop().call_later(5, lambda: asyncio.ensure_future(
             asyncio.to_thread(kaggle_prune)))
     except Busy:
-        await safe_edit(status, "⏳ Kaggle ещё занят предыдущим. Подожди и запусти заново.")
+        await safe_edit(status, "⏳ Kaggle ещё занят. Вернул задание в очередь.")
+        raise
     except Exception as e:
         print("LAUNCH ERROR:", e, flush=True)
         await safe_edit(status, f"❌ Ошибка Kaggle:\n{str(e)[-700:]}")
@@ -760,6 +768,12 @@ async def queue_worker(app):
         await asyncio.sleep(8)
         if PROCESSING or not RUNNING or not QUEUE:
             continue
+        try:
+            if await asyncio.to_thread(kaggle_busy):
+                await asyncio.sleep(20)
+                continue
+        except Exception as e:
+            print("QUEUE BUSY CHECK:", e, flush=True)
         PROCESSING = True
         item = QUEUE.pop(0)
         chat_id = item["chat_id"]
@@ -770,6 +784,16 @@ async def queue_worker(app):
             prefix = f"📋 Осталось: {n_left}\n" if n_left else ""
             await app.bot.send_message(chat_id, prefix + "🎬 Запускаю видео…")
             await launch(chat_id, job, app.bot)
+            for _ in range(6):
+                await asyncio.sleep(5)
+                try:
+                    if await asyncio.to_thread(kaggle_busy):
+                        break
+                except Exception:
+                    break
+        except Busy:
+            QUEUE.insert(0, item)
+            queue_save()
         except Exception as e:
             print("QUEUE ERROR:", e, flush=True)
             try:
