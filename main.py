@@ -483,7 +483,7 @@ async def ask_banner(msg, context):
     row.append(CANCEL)
     _track(context, await msg.reply_text(
         "3/5. Пришли баннер файлом (mp4/gif/webm) или пропусти.",
-        reply_markup=kb(row)))
+        reply_markup=kb([row])))
 
 
 async def ask_cover(msg, context):
@@ -491,7 +491,7 @@ async def ask_cover(msg, context):
     rows = _back_row(job) + [("⏭ Пропустить", "skip_cover"), CANCEL]
     _track(context, await msg.reply_text(
         "4/5. Напиши текст обложки или пропусти.",
-        reply_markup=kb(rows)))
+        reply_markup=kb([rows])))
 
 
 def ready_text(job):
@@ -640,7 +640,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["bgs"] += urls
         _track(context, await msg.reply_text(
             f"Фонов: {len(job['bgs'])}. Ещё или «Готово».",
-            reply_markup=kb(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])))
+            reply_markup=kb([_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]])))
     elif step == "cover":
         job["cover_text"] = text
         job["step"] = "ready"
@@ -677,7 +677,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["bgs"].append({"file_id": obj.file_id})
         _track(context, await msg.reply_text(
             f"Фонов: {len(job['bgs'])}. Ещё или «Готово».",
-            reply_markup=kb(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])))
+            reply_markup=kb([_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]])))
     elif step == "banner":
         STATE["banner"] = obj.file_id
         job["banner_file_id"] = obj.file_id
