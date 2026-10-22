@@ -1,1 +1,1 @@
-{"queue": [], "running": false}
+{"queue": [{"job": {"id": "eef8d281", "step": "ready", "bgs": [{"url": "https://vt.tiktok.com/ZSgSSKx5J/", "name": "А", "source": "library", "bg_id": "bg_f7481ec4a16b", "end_time": null}], "style": "classic", "audio": "https://vt.tiktok.com/ZSgPu622r/", "banner_file_id": "BAACAgIAAxkBAAIC-GraK5cC20ZbGtNA9gABn1EaoXqhbwACGKgAAmDC0EpWyCSlmGT0TD0E", "cover_text": "Как вы встретили знаменитость сами того не зная."}, "chat_id": 5394667051}], "running": false}
