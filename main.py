@@ -486,16 +486,20 @@ async def start_job(msg, context):
         reply_markup=kb([CANCEL])))
 
 
-async def ask_bgs(msg, context):
-    job = context.user_data["job"]
+def bgs_kb(job):
     rows = []
     if BACKGROUNDS:
         rows.append([("📚 Мои фоны", "bg_library")])
         rows.append([("🎲 Случайный фон", "bg_random")])
     rows.append(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])
+    return kb(*rows)
+
+
+async def ask_bgs(msg, context):
+    job = context.user_data["job"]
     _track(context, await msg.reply_text(
         "2/5. Пришли фоны — ссылками или файлами. Склеятся по порядку. Жми «Готово» когда хватит.",
-        reply_markup=kb(*rows)))
+        reply_markup=bgs_kb(job)))
 
 
 async def ask_banner(msg, context):
@@ -544,21 +548,24 @@ async def cmd_bg_library(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать сохранённые фоны с превью."""
     if not await guard(update):
         return
+    msg = update.effective_message
+    job = context.user_data.get("job")
+    in_bgs = bool(job and job.get("step") == "bgs")
+    back_row = [("◀️ К фонам", "bgs_resume")] if in_bgs else [("◀️ Назад в меню", "menu_back")]
     if not BACKGROUNDS:
-        await update.message.reply_text(
+        await msg.reply_text(
             "Библиотека фонов пуста.\nПришли ссылку на видео — и она сохранится как фон.",
-            reply_markup=kb([("➕ Добавить фон", "bg_add")], [("◀️ Назад в меню", "menu_back")]))
+            reply_markup=kb([("➕ Добавить фон", "bg_add")], back_row))
         return
     lines = ["📚 Мои фоны:\n"]
     for b in BACKGROUNDS:
         lines.append(f"• {b['name']}\n  {b['url'][:60]}")
     text = "\n".join(lines)
-    kb_markup = kb(
+    await msg.reply_text(text, reply_markup=kb(
         [("➕ Добавить фон", "bg_add")],
         [("🗑 Удалить фон", "bg_delete")],
-        [("◀️ Назад в меню", "menu_back")],
-    )
-    await update.message.reply_text(text, reply_markup=kb_markup)
+        back_row,
+    ))
 
 
 async def cmd_bg_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,14 +582,15 @@ async def cmd_bg_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удаление фона — показываем список с кнопками удалить."""
     if not await guard(update):
         return
+    msg = update.effective_message
     if not BACKGROUNDS:
-        await update.message.reply_text("Библиотека пуста.")
+        await msg.reply_text("Библиотека пуста.")
         return
     rows = []
     for b in BACKGROUNDS:
         rows.append([(f"🗑 {b['name'][:30]}", f"bg_del_{b['id']}")])
     rows.append([("◀️ Назад", "bg_lib_back")])
-    await update.message.reply_text("Выбери фон для удаления:", reply_markup=kb(*rows))
+    await msg.reply_text("Выбери фон для удаления:", reply_markup=kb(*rows))
 
 
 # ---------------------------- приём данных ----------------------------
@@ -624,9 +632,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             end_time = None
             bg_id = backgrounds_add(url, name, end_time=end_time, preview_bytes=preview_bytes)
             context.user_data.pop("bg_flow", None)
+            job = context.user_data.get("job")
+            markup = bgs_kb(job) if job and job.get("step") == "bgs" else MENU
             await msg.reply_text(
                 f"✅ Фон сохранён: {name or url}\nID: {bg_id}",
-                reply_markup=MENU)
+                reply_markup=markup)
             return
 
     if text == "🎬 Новое видео":
@@ -916,7 +926,18 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_bg_library(update, context)
         return
 
+    if data == "bgs_resume":
+        if not job:
+            await msg.reply_text("Это уже неактуально. Жми «🎬 Новое видео».", reply_markup=MENU)
+            return
+        job["step"] = "bgs"
+        await ask_bgs(msg, context)
+        return
+
     if data == "bg_random":
+        if not job:
+            await msg.reply_text("Это уже неактуально. Жми «🎬 Новое видео».", reply_markup=MENU)
+            return
         if not BACKGROUNDS:
             await msg.reply_text("Библиотека фонов пуста.")
             return
@@ -929,7 +950,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "bg_id": bg["id"],
             "end_time": bg.get("end_time"),
         })
-        await safe_edit(msg, f"✅ Добавлен случайный фон: {bg['name']}")
+        _track(context, msg)
+        await safe_edit(
+            msg,
+            f"✅ Добавлен случайный фон: {bg['name']}\n"
+            f"Фонов: {len(job['bgs'])}. Ещё или «Готово».",
+            bgs_kb(job))
         return
 
     if data == "cancel_run":
