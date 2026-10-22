@@ -76,8 +76,31 @@ class Busy(Exception):
     pass
 
 
+def _is_button(x):
+    return isinstance(x, (tuple, list)) and len(x) == 2 and all(isinstance(v, str) for v in x)
+
+
+def _rows_of(x):
+    if _is_button(x):
+        return [[x]]
+    if isinstance(x, (list, tuple)):
+        items = list(x)
+        if not items:
+            return []
+        if all(_is_button(i) for i in items):
+            return [items]
+        out = []
+        for i in items:
+            out.extend(_rows_of(i))
+        return out
+    return []
+
+
 def kb(*rows):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=c) for t, c in row] for row in rows])
+    norm = []
+    for r in rows:
+        norm.extend(_rows_of(r))
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=c) for t, c in row] for row in norm])
 
 
 def file_obj(msg):
@@ -472,7 +495,7 @@ async def ask_bgs(msg, context):
     rows.append(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])
     _track(context, await msg.reply_text(
         "2/5. Пришли фоны — ссылками или файлами. Склеятся по порядку. Жми «Готово» когда хватит.",
-        reply_markup=kb(rows)))
+        reply_markup=kb(*rows)))
 
 
 async def ask_banner(msg, context):
@@ -483,7 +506,7 @@ async def ask_banner(msg, context):
     row.append(CANCEL)
     _track(context, await msg.reply_text(
         "3/5. Пришли баннер файлом (mp4/gif/webm) или пропусти.",
-        reply_markup=kb([row])))
+        reply_markup=kb(row)))
 
 
 async def ask_cover(msg, context):
@@ -491,7 +514,7 @@ async def ask_cover(msg, context):
     rows = _back_row(job) + [("⏭ Пропустить", "skip_cover"), CANCEL]
     _track(context, await msg.reply_text(
         "4/5. Напиши текст обложки или пропусти.",
-        reply_markup=kb([rows])))
+        reply_markup=kb(rows)))
 
 
 def ready_text(job):
@@ -640,7 +663,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["bgs"] += urls
         _track(context, await msg.reply_text(
             f"Фонов: {len(job['bgs'])}. Ещё или «Готово».",
-            reply_markup=kb([_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]])))
+            reply_markup=kb(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])))
     elif step == "cover":
         job["cover_text"] = text
         job["step"] = "ready"
@@ -677,7 +700,7 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["bgs"].append({"file_id": obj.file_id})
         _track(context, await msg.reply_text(
             f"Фонов: {len(job['bgs'])}. Ещё или «Готово».",
-            reply_markup=kb([_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]])))
+            reply_markup=kb(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])))
     elif step == "banner":
         STATE["banner"] = obj.file_id
         job["banner_file_id"] = obj.file_id
@@ -836,6 +859,29 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         RUNNING = False
         queue_save()
         await safe_edit(msg, "⏸ Пауза. Очередь сохранена.", queue_kb())
+        return
+
+    if data == "back":
+        if not job:
+            await msg.reply_text("Нечего откатывать.", reply_markup=MENU)
+            return
+        step = job.get("step", "audio")
+        idx = STEP_ORDER.index(step) if step in STEP_ORDER else 0
+        if idx > 0:
+            job["step"] = STEP_ORDER[idx - 1]
+        prev = job["step"]
+        await cleanup_flow(msg.chat_id, context, context.bot)
+        _track(context, msg)
+        if prev == "audio":
+            _track(context, await msg.reply_text(
+                "1/5. Пришли озвучку — ссылкой или файлом (до 20 МБ).",
+                reply_markup=kb([CANCEL])))
+        elif prev == "bgs":
+            await ask_bgs(msg, context)
+        elif prev == "banner":
+            await ask_banner(msg, context)
+        elif prev == "cover":
+            await ask_cover(msg, context)
         return
 
     if data == "menu_back":
