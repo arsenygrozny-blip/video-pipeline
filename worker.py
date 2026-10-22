@@ -152,8 +152,12 @@ CANCEL_KB = json.dumps({"inline_keyboard": [[{"text": "🛑 Отменить", "
 NO_KB = json.dumps({"inline_keyboard": []})
 
 
+_STATUS_OK = False
+
+
 def notify(text, final=False):
-    """Обновляет статус в чате. Если статус-сообщение удалили (кнопка «Отменить»), останавливаемся."""
+    """Обновляет статус в чате. «Отмена» — это удаление статус-сообщения уже во время работы."""
+    global STATUS_MSG, _STATUS_OK
     if not STATUS_MSG:
         return
     try:
@@ -163,8 +167,25 @@ def notify(text, final=False):
                           timeout=30).json()
     except Exception:
         return
-    if not r.get("ok") and "not found" in str(r.get("description", "")).lower():
+    if r.get("ok"):
+        _STATUS_OK = True
+        return
+    if "not found" not in str(r.get("description", "")).lower():
+        return
+    if _STATUS_OK:
         raise Cancelled()
+    print("статус-сообщение удалено до старта — продолжаю без него", flush=True)
+    try:
+        m = requests.post(f"{API}/sendMessage",
+                          data={"chat_id": CHAT, "text": "ℹ️ Статус-сообщение удалено, продолжаю работу…"},
+                          timeout=30).json()
+        if m.get("ok"):
+            STATUS_MSG = m["result"]["message_id"]
+            _STATUS_OK = True
+        else:
+            STATUS_MSG = None
+    except Exception:
+        STATUS_MSG = None
 
 
 def send_file(method, field, path, extra=None, **data):
@@ -668,6 +689,7 @@ def assemble(bg, audio, ass, banner, cover, dur, out):
 
 
 def make_video(job, banner, d):
+    print("make_video: старт", flush=True)
     apply_style(job)
     notify("⬇️ Скачиваю озвучку…")
     raw = resolve(job["audio"], d, "voice", audio=True)
@@ -745,14 +767,17 @@ def main():
     shutil.rmtree(d, ignore_errors=True)
     d.mkdir(parents=True, exist_ok=True)
     try:
+        print("main: старт", flush=True)
         notify("⚙️ Kaggle запустился, готовлюсь…")
         ensure_fonts()
         write_cookies()
         ensure_js_runtime()
         FF = pick_ffmpeg()
+        print("ffmpeg:", FF, flush=True)
         banner = None
         if JOB.get("banner_file_id"):  # noqa: F821
             banner = fetch_telegram_file(JOB["banner_file_id"], d / "banner.bin")  # noqa: F821
+            print("баннер скачан", flush=True)
         out, cover, dur = make_video(JOB, banner, d)  # noqa: F821
         notify("📤 Отправляю…")
         thumb = None
