@@ -469,7 +469,7 @@ async def ask_bgs(msg, context):
     if BACKGROUNDS:
         rows.append([("📚 Мои фоны", "bg_library")])
         rows.append([("🎲 Случайный фон", "bg_random")])
-    rows += _back_row(job) + [("✅ Готово", "bgs_done"), CANCEL]
+    rows.append(_back_row(job) + [("✅ Готово", "bgs_done"), CANCEL])
     _track(context, await msg.reply_text(
         "2/5. Пришли фоны — ссылками или файлами. Склеятся по порядку. Жми «Готово» когда хватит.",
         reply_markup=kb(rows)))
