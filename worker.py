@@ -655,13 +655,17 @@ def make_cover(frame_path, text, out_path):
 def assemble(bg, audio, ass, banner, cover, dur, out):
     inputs = ["-stream_loop", "-1", "-i", bg, "-i", audio]
     chain, cur, idx = [], "[0:v]", 2
+    chain.append(f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase,"
+                 f"crop={W}:{H},setsar=1[bg0]")
+    cur = "[bg0]"
 
     if banner:
         inputs += ["-stream_loop", "-1", "-i", banner]
         b = f"[{idx}:v]"
         if BANNER["colorkey"]:
             b += f"format=rgba,colorkey={BANNER['colorkey']},"
-        b += f"scale={BANNER['width']}:-2[bn]"
+        b += (f"scale={BANNER['width']}:{int(H * 0.3)}:force_original_aspect_ratio=decrease:"
+              f"force_divisible_by=2,setsar=1[bn]")
         y = f"H-h-{BANNER['margin']}" if BANNER["pos"] == "bottom" else str(BANNER["margin"])
         chain += [b, f"{cur}[bn]overlay=(W-w)/2:{y}[v1]"]
         cur = "[v1]"
