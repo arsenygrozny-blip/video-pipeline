@@ -821,23 +821,12 @@ def clean_cover_text(raw):
     return t[0].upper() + t[1:]
 
 
-def first_question(text):
-    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s*", text) if p.strip()]
-    for p in parts:
-        if p.rstrip().endswith(("?", "?!")) and len(p.split()) >= 2:
-            return p.strip(" \"'«»“”`")
-    return ""
-
-
-def first_sentence(text):
-    text = re.sub(r"\s+([,.!?…:;])", r"\1", (text or "").strip())
-    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
-    for p in parts:
-        if re.match(r"(?i)^(привет|всем привет|здравствуйте|добрый день|"
-                    r"добрый вечер|друзья|ребята)[!,. ]*$", p):
-            continue
-        return p
-    return text
+def is_greeting(t):
+    t = (t or "").strip()
+    return ("?" not in t and len(t) <= 40
+            and bool(re.match(r"(?i)^(привет|приветствую|здравствуйте|"
+                              r"добрый день|добрый вечер|всем привет|"
+                              r"друзья|ребята)\b", t)))
 
 
 def is_question_sentence(t):
@@ -847,11 +836,31 @@ def is_question_sentence(t):
     if t.endswith(("?", "?!")):
         return True
     low = t.lower()
-    if re.match(r"^(какой|какая|какое|какие|почему|зачем|что|кто|где|"
+    if re.match(r"^(какой|какая|какое|какие|почему|зачем|кто|где|"
                 r"когда|сколько|куда|откуда|чей|чья|чьё|чьи)\b", low):
         return True
     return bool(re.search(r"\b(какой|какая|какое|какие)\b", low)
                 and re.search(r"\bбы\b", low))
+
+
+def opening_question(text, limit=160):
+    text = re.sub(r"\s+([,.!?…:;])", r"\1", (text or "").strip())
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    while parts and is_greeting(parts[0]):
+        parts.pop(0)
+    if not parts:
+        return ""
+    qi = None
+    for i, p in enumerate(parts):
+        if is_question_sentence(p):
+            qi = i
+            break
+    if qi is None:
+        return ""
+    t = " ".join(parts[:qi + 1])
+    if len(t) > limit:
+        t = parts[qi]
+    return t
 
 
 def clean_opening(raw):
@@ -967,8 +976,7 @@ def make_video(job, banner, d):
     if ctext == AUTO_COVER:
         opening = " ".join(w for _, _, w in words[:90]).strip()
         opening = re.sub(r"\s+([,.!?…:;])", r"\1", opening)
-        first = first_sentence(opening)
-        q = first if is_question_sentence(first) else first_question(opening)
+        q = opening_question(opening)
         ctext = clean_opening(q) if q else ""
         if ctext:
             print(f"обложка-вопрос: «{ctext}»", flush=True)
