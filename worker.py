@@ -728,10 +728,13 @@ def make_video(job, banner, d):
     sub_top = None
     if banner:
         bw, bh = video_size(banner)
-        if bw:
+        if bw and bh:
+            # реальная высота баннера после scale (вписан в W x 0.3H)
+            k = min(BANNER["width"] / bw, int(H * 0.3) / bh)
+            disp_h = max(2, int(round(bh * k / 2)) * 2)
             # надпись «подпишись» ставим под баннером, чтобы не наезжала на него
-            sub_top = BANNER["margin"] + round(bh * BANNER["width"] / bw) + 40
-            print(f"баннер {bw}x{bh} → надпись начнётся с {sub_top}px")
+            sub_top = BANNER["margin"] + disp_h + 40
+            print(f"баннер {bw}x{bh} → {round(bw * k)}x{disp_h}, надпись с {sub_top}px")
     ass_ok = make_ass(words, ass, sub_top)
 
     cover = None
