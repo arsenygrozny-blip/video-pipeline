@@ -829,18 +829,45 @@ def first_question(text):
     return ""
 
 
-def clean_question(raw):
+def first_sentence(text):
+    text = re.sub(r"\s+([,.!?…:;])", r"\1", (text or "").strip())
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    for p in parts:
+        if re.match(r"(?i)^(привет|всем привет|здравствуйте|добрый день|"
+                    r"добрый вечер|друзья|ребята)[!,. ]*$", p):
+            continue
+        return p
+    return text
+
+
+def is_question_sentence(t):
+    t = (t or "").strip()
+    if not t:
+        return False
+    if t.endswith(("?", "?!")):
+        return True
+    low = t.lower()
+    if re.match(r"^(какой|какая|какое|какие|почему|зачем|что|кто|где|"
+                r"когда|сколько|куда|откуда|чей|чья|чьё|чьи)\b", low):
+        return True
+    return bool(re.search(r"\b(какой|какая|какое|какие)\b", low)
+                and re.search(r"\bбы\b", low))
+
+
+def clean_opening(raw):
     t = (raw or "").strip().strip(" \"'«»“”`")
     t = re.sub(r"\s+", " ", t).strip()
     if not t or not re.search(r"[А-Яа-яЁё]", t):
         return ""
-    if not t.endswith(("?", "?!")):
-        t = t.rstrip(" .,!…") + "?"
-    if len(t) > 120:
-        cut = t[:120]
+    q = is_question_sentence(t)
+    if len(t) > 160:
+        cut = t[:160]
         if " " in cut:
             cut = cut[:cut.rfind(" ")]
-        t = cut.rstrip(" .,-—–") + "?"
+        t = cut.rstrip(" ,.-—–")
+    t = t.rstrip(" .,!…")
+    if q and not t.endswith("?"):
+        t += "?"
     return t[0].upper() + t[1:]
 
 
@@ -940,8 +967,9 @@ def make_video(job, banner, d):
     if ctext == AUTO_COVER:
         opening = " ".join(w for _, _, w in words[:90]).strip()
         opening = re.sub(r"\s+([,.!?…:;])", r"\1", opening)
-        q = first_question(opening)
-        ctext = clean_question(q) if q else ""
+        first = first_sentence(opening)
+        q = first if is_question_sentence(first) else first_question(opening)
+        ctext = clean_opening(q) if q else ""
         if ctext:
             print(f"обложка-вопрос: «{ctext}»", flush=True)
         else:
