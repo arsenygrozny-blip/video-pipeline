@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 import urllib.request
 from pathlib import Path
@@ -94,6 +95,29 @@ COVER = dict(
     width_ratio=0.92,
     max_lines=6,
     first_frame=False,
+)
+
+# Авто-текст обложки: локальная 7B через Ollama (ключи не нужны)
+AUTO_COVER = "__auto__"
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5:7b-instruct-q4_K_M")
+LLM_DIR = Path("/kaggle/tmp/ollama")
+LLM_MODELS = Path("/kaggle/tmp/ollama-models")
+LLM_URL = "http://127.0.0.1:11434"
+LLM_PROMPT = (
+    "Ты — редактор обложек для коротких видео на русском. "
+    "Начало озвучки — это сразу вопрос или тема, без вступления.\n"
+    "Сделай из него короткий цепляющий текст для обложки.\n"
+    "Правила:\n"
+    "- 4–7 слов. Если начало уже короткое, оставь его почти как есть, "
+    "убрав только «ну», «вот», «короче», «типа», «как бы».\n"
+    "- Сохрани смысл. Если это вопрос — оставь вопросительный знак.\n"
+    "- Можно переформулировать, но не придумывай новую тему.\n"
+    "- Без кавычек, эмодзи, хэштегов и точки в конце.\n"
+    "- Верни только текст обложки, без пояснений.\n"
+    "Примеры:\n"
+    "«Какие самые интересные истории вы знаете?» → «Какие истории вы знаете?»\n"
+    "«Сегодня расскажу, как я бросил курить» → «Как я бросил курить»\n"
+    "«В этом видео я покажу, как приготовить пасту за 10 минут» → «Паста за 10 минут»"
 )
 
 FONT_URLS = {
@@ -651,6 +675,168 @@ def make_cover(frame_path, text, out_path):
     img.convert("RGB").save(out_path, quality=95)
 
 
+# ---------------------------- ИИ-текст обложки ----------------------------
+_ollama_proc = None
+_ollama_log = None
+
+
+def _free_whisper():
+    """Освобождаем VRAM перед 7B: Whisper больше не нужен."""
+    _models.pop("cuda", None)
+    _models.pop("cpu", None)
+    import gc
+    gc.collect()
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _ollama_tail(n=1200):
+    try:
+        p = Path("/kaggle/tmp/ollama.log")
+        return p.read_text(errors="replace")[-n:] if p.exists() else ""
+    except Exception:
+        return ""
+
+
+def _ensure_ollama():
+    global _ollama_proc, _ollama_log
+    binp = LLM_DIR / "bin" / "ollama"
+    if not binp.exists():
+        LLM_DIR.mkdir(parents=True, exist_ok=True)
+        arc = Path("/kaggle/tmp/ollama.tar.zst")
+        if not arc.exists():
+            print("ollama: качаю архив…", flush=True)
+            urllib.request.urlretrieve(
+                "https://ollama.com/download/ollama-linux-amd64.tar.zst", arc)
+        print("ollama: распаковываю…", flush=True)
+        try:
+            import zstandard
+        except ImportError:
+            _sh("pip install -q zstandard")
+            import zstandard
+        import tarfile
+        with open(arc, "rb") as f:
+            with zstandard.ZstdDecompressor().stream_reader(f) as r:
+                with tarfile.open(fileobj=r, mode="r|") as tar:
+                    tar.extractall(LLM_DIR)
+    LLM_MODELS.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["OLLAMA_MODELS"] = str(LLM_MODELS)
+    env["OLLAMA_HOST"] = "127.0.0.1:11434"
+    libs = f"{LLM_DIR / 'lib'}:{LLM_DIR / 'lib' / 'ollama'}"
+    if env.get("LD_LIBRARY_PATH"):
+        libs += ":" + env["LD_LIBRARY_PATH"]
+    env["LD_LIBRARY_PATH"] = libs
+    if _ollama_proc is None or _ollama_proc.poll() is not None:
+        print("ollama: запускаю сервер…", flush=True)
+        _ollama_log = open("/kaggle/tmp/ollama.log", "ab")
+        _ollama_proc = subprocess.Popen(
+            [str(binp), "serve"], env=env,
+            stdout=_ollama_log, stderr=subprocess.STDOUT)
+    for _ in range(120):
+        try:
+            requests.get(LLM_URL + "/api/tags", timeout=2)
+            return
+        except Exception:
+            time.sleep(1)
+    raise RuntimeError("Ollama не поднялся за 120 сек:\n" + _ollama_tail())
+
+
+def _stop_ollama():
+    global _ollama_proc
+    if _ollama_proc is not None and _ollama_proc.poll() is None:
+        try:
+            _ollama_proc.terminate()
+            _ollama_proc.wait(timeout=10)
+        except Exception:
+            try:
+                _ollama_proc.kill()
+            except Exception:
+                pass
+    _ollama_proc = None
+
+
+def _ollama_pull():
+    print(f"ollama: pull {LLM_MODEL}…", flush=True)
+    r = requests.post(LLM_URL + "/api/pull",
+                      json={"model": LLM_MODEL, "stream": False},
+                      timeout=1200)
+    if r.status_code != 200:
+        raise RuntimeError(f"ollama pull {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _ollama_chat(opening, num_gpu=None):
+    opts = {"temperature": 0.3, "num_predict": 48, "num_ctx": 2048}
+    if num_gpu is not None:
+        opts["num_gpu"] = num_gpu
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": LLM_PROMPT},
+            {"role": "user", "content": opening},
+        ],
+        "stream": False,
+        "options": opts,
+    }
+    r = requests.post(LLM_URL + "/api/chat", json=payload, timeout=300)
+    if r.status_code != 200:
+        raise RuntimeError(f"ollama chat {r.status_code}: {r.text[:300]}")
+    return (r.json().get("message") or {}).get("content", "")
+
+
+def llm_cover_text(opening):
+    _ensure_ollama()
+    _ollama_pull()
+    try:
+        return _ollama_chat(opening)
+    except Exception as e:
+        print("ollama: GPU-запуск не вышел, пробую CPU:", repr(e), flush=True)
+        return _ollama_chat(opening, num_gpu=0)
+
+
+def clean_cover_text(raw):
+    t = (raw or "").strip()
+    if not t:
+        return ""
+    t = t.splitlines()[0].strip().strip(" \"'«»“”`")
+    t = re.sub(r"^(текст обложки|обложка|вариант)\s*[:—-]\s*", "", t, flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip().rstrip(" .,-—–")
+    words = t.split()
+    if len(words) < 2 or len(words) > 10:
+        return ""
+    if len(t) > 75:
+        cut = t[:75]
+        if " " in cut:
+            cut = cut[:cut.rfind(" ")]
+        t = cut.rstrip(" .,-—–")
+    if not re.search(r"[А-Яа-яЁё]", t):
+        return ""
+    return t[0].upper() + t[1:]
+
+
+def first_line_cover(words, limit=60):
+    text = " ".join(w for _, _, w in words).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+([,.!?…:;])", r"\1", text)
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", text) if p.strip()]
+    t = parts[0] if parts else text
+    t = t.strip(" \"'«»“”`")
+    if len(t) > limit:
+        cut = t[:limit]
+        if " " in cut:
+            cut = cut[:cut.rfind(" ")]
+        t = cut.rstrip(" ,.-—–")
+    t = re.sub(r"\s+", " ", t).strip()
+    if t:
+        t = t[0].upper() + t[1:]
+    return t
+
+
 # ---------------------------- сборка ----------------------------
 def assemble(bg, audio, ass, banner, cover, dur, out):
     inputs = ["-stream_loop", "-1", "-i", bg, "-i", audio]
@@ -724,6 +910,27 @@ def make_video(job, banner, d):
 
     notify("📝 Распознаю речь…")
     words = transcribe(audio)
+    ctext = job.get("cover_text")
+    if ctext == AUTO_COVER:
+        notify("🖼 Придумываю текст обложки (ИИ)…")
+        opening = " ".join(w for _, _, w in words[:60]).strip()
+        opening = re.sub(r"\s+([,.!?…:;])", r"\1", opening)
+        ctext = ""
+        if opening:
+            try:
+                _free_whisper()
+                raw = llm_cover_text(opening)
+                ctext = clean_cover_text(raw)
+                print(f"обложка ИИ: «{raw.strip()[:120]}» → «{ctext}»", flush=True)
+            except Exception as e:
+                print("ИИ-обложка не сработала:", repr(e), flush=True)
+        if not ctext:
+            ctext = first_line_cover(words)
+            print(f"обложка фолбэк: «{ctext}»", flush=True)
+        if ctext:
+            notify(f"🖼 Текст обложки: «{ctext}»")
+        else:
+            notify("🖼 Текст обложки не получился — сделаю без обложки.")
     ass = d / "subs.ass"
     sub_top = None
     if banner:
@@ -738,12 +945,12 @@ def make_video(job, banner, d):
     ass_ok = make_ass(words, ass, sub_top)
 
     cover = None
-    if job.get("cover_text"):
+    if ctext:
         notify("🖼 Делаю обложку…")
         base = d / "base.jpg"
         run([FF, "-y", "-ss", "0.5", "-i", bg, "-frames:v", "1", base])
         cover = d / "cover.jpg"
-        make_cover(base, job["cover_text"], cover)
+        make_cover(base, ctext, cover)
 
     notify("🎞 Собираю видео…")
     out = d / "result.mp4"
@@ -822,6 +1029,10 @@ def main():
             pass
     finally:
         wd.cancel()
+        try:
+            _stop_ollama()
+        except Exception:
+            pass
         shutil.rmtree(d, ignore_errors=True)
 
 

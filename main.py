@@ -41,10 +41,10 @@ WORKER_SRC = WORKER_FILE.read_text(encoding="utf-8")
 URL_RE = re.compile(r"https?://\S+")
 YT_RE = re.compile(r"(?:youtube\.com/watch\?v=|youtu\.be/)([A-Za-z0-9_-]{11})")
 
-STATE = {"banner": os.environ.get("BANNER_FILE_ID", "")}
+STATE = {"banner": os.environ.get("BANNER_FILE_ID", ""), "style": None, "last_bg": ""}
 
 MENU = ReplyKeyboardMarkup(
-    [["🎬 Новое видео", "📊 Квоты"], ["📋 Очередь", "📚 Мои фоны"]],
+    [["⚡ Быстро", "🎬 Новое видео"], ["📊 Квоты", "📋 Очередь"], ["📚 Мои фоны"]],
     resize_keyboard=True,
 )
 CANCEL = ("❌ Отмена", "cancel")
@@ -66,6 +66,8 @@ STYLE_LABELS = dict(STYLES)
 DEFAULT_STYLE = (os.environ.get("STYLE", "classic") or "classic").strip().lower()
 if DEFAULT_STYLE not in STYLE_LABELS:
     DEFAULT_STYLE = "classic"
+
+AUTO_COVER = "__auto__"
 
 MAX_UPLOAD = 20 * 1024 * 1024
 
@@ -459,7 +461,9 @@ async def guard(update: Update):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
-    await update.message.reply_text("Готов. Жми «🎬 Новое видео».", reply_markup=MENU)
+    await update.message.reply_text(
+        "Готов. Жми «⚡ Быстро» — сделаю всё сам, или «🎬 Новое видео» для ручной настройки.",
+        reply_markup=MENU)
 
 
 def _track(context, msg):
@@ -493,6 +497,52 @@ async def start_job(msg, context):
         reply_markup=kb([CANCEL])))
 
 
+async def start_quick(msg, context):
+    await cleanup_flow(msg.chat_id, context, context.bot)
+    context.user_data["job"] = {"id": uuid.uuid4().hex[:8], "step": "quick_audio",
+                                "bgs": [], "style": STATE.get("style") or DEFAULT_STYLE}
+    _track(context, msg)
+    _track(context, await msg.reply_text(
+        "⚡ Быстрый режим. Кидай ссылку на озвучку или файл — "
+        "фон, баннер и обложку сделаю сам.",
+        reply_markup=kb([CANCEL])))
+
+
+async def quick_build(msg, context, audio):
+    global RUNNING
+    job = context.user_data.pop("job", None)
+    if not job:
+        return
+    if not BACKGROUNDS:
+        await msg.reply_text(
+            "Нет фонов. Добавь через «📚 Мои фоны», потом снова «⚡ Быстро».",
+            reply_markup=MENU)
+        return
+    import random
+    pool = [b for b in BACKGROUNDS if b["id"] != STATE.get("last_bg")]
+    bg = random.choice(pool or BACKGROUNDS)
+    STATE["last_bg"] = bg["id"]
+    job.update({
+        "audio": audio,
+        "bgs": [{"url": bg["url"], "name": bg["name"], "source": "library",
+                 "bg_id": bg["id"], "end_time": bg.get("end_time")}],
+        "banner_file_id": STATE.get("banner") or None,
+        "cover_text": AUTO_COVER,
+        "step": "ready",
+    })
+    QUEUE.insert(0, {"job": job, "chat_id": msg.chat_id})
+    RUNNING = True
+    queue_save()
+    banner_txt = "прошлый" if job.get("banner_file_id") else "нет"
+    note = ("Сейчас рендерится другое видео — это задание следующее."
+            if PROCESSING else "Запускаю.")
+    _track(context, await msg.reply_text(
+        f"⚡ Принял:\n• фон: {bg['name']}\n• баннер: {banner_txt}\n"
+        f"• обложка: авто (ИИ)\n"
+        f"• стиль: {STYLE_LABELS.get(job['style'], job['style'])}\n{note}",
+        reply_markup=kb([("🛑 Убрать из очереди", f"cancel_quick:{job['id']}")])))
+
+
 def bgs_kb(job):
     rows = []
     if BACKGROUNDS:
@@ -522,10 +572,19 @@ async def ask_banner(msg, context):
 
 async def ask_cover(msg, context):
     job = context.user_data["job"]
-    rows = _back_row(job) + [("⏭ Пропустить", "skip_cover"), CANCEL]
+    rows = _back_row(job) + [[("🪄 Авто-текст", "auto_cover"),
+                              ("⏭ Пропустить", "skip_cover")], [CANCEL]]
     _track(context, await msg.reply_text(
-        "4/5. Напиши текст обложки или пропусти.",
-        reply_markup=kb(rows)))
+        "4/5. Напиши текст обложки, жми «🪄 Авто-текст» (возьму начало озвучки) или пропусти.",
+        reply_markup=kb(*rows)))
+
+
+def cover_label(cover, short=False):
+    if cover == AUTO_COVER:
+        return "авто"
+    if not cover:
+        return ""
+    return f"«{cover[:20] if short else cover[:60]}»"
 
 
 def ready_text(job):
@@ -533,7 +592,7 @@ def ready_text(job):
     style = job.get("style", DEFAULT_STYLE)
     return (f"Всё готово:\n• озвучка: есть\n• фонов: {len(job['bgs'])}\n"
             f"• баннер: {'да' if job.get('banner_file_id') else 'нет'}\n"
-            f"• обложка: {('«' + cover[:60] + '»') if cover else 'нет'}\n"
+            f"• обложка: {cover_label(cover) or 'нет'}\n"
             f"• стиль: {STYLE_LABELS.get(style, style)}\n\n"
             f"Добавь в очередь, потом запусти когда готов.")
 
@@ -646,6 +705,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=markup)
             return
 
+    if text == "⚡ Быстро":
+        await start_quick(msg, context)
+        return
     if text == "🎬 Новое видео":
         await start_job(msg, context)
         return
@@ -664,7 +726,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     _track(context, msg)
     step = job["step"]
-    if step == "audio":
+    if step == "quick_audio":
+        urls = URL_RE.findall(text)
+        if not urls:
+            await msg.reply_text("Нужна ссылка (http…) или файлом.")
+            return
+        await quick_build(msg, context, urls[0])
+    elif step == "audio":
         urls = URL_RE.findall(text)
         if not urls:
             await msg.reply_text("Нужна ссылка (http…) или файлом.")
@@ -708,7 +776,9 @@ async def on_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     step = job["step"]
     _track(context, msg)
-    if step == "audio":
+    if step == "quick_audio":
+        await quick_build(msg, context, {"file_id": obj.file_id})
+    elif step == "audio":
         job["audio"] = {"file_id": obj.file_id}
         job["step"] = "bgs"
         _track(context, await msg.reply_text("Озвучка принята."))
@@ -816,8 +886,8 @@ def queue_snapshot():
         j = item["job"]
         style = j.get("style", DEFAULT_STYLE)
         n_bgs = len(j.get("bgs", []))
-        cover = j.get("cover_text", "")
-        cover_short = f", «{cover[:20]}»" if cover else ""
+        cover = cover_label(j.get("cover_text"), short=True)
+        cover_short = f", {cover}" if cover else ""
         lines.append(f"{i}. {STYLE_LABELS.get(style, style)}, фонов: {n_bgs}{cover_short}")
     if not lines:
         lines.append("Очередь пуста.")
@@ -873,6 +943,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("bg_flow", None)
         await cleanup_flow(msg.chat_id, context, context.bot)
         await msg.reply_text("Отменено.", reply_markup=MENU)
+        return
+
+    if data.startswith("cancel_quick:"):
+        jid = data.split(":", 1)[1]
+        removed = False
+        for i, item in enumerate(QUEUE):
+            if item["job"].get("id") == jid:
+                QUEUE.pop(i)
+                removed = True
+                break
+        if removed:
+            queue_save()
+            await safe_edit(msg, "🛑 Убрал из очереди.")
+        else:
+            await safe_edit(msg, "Уже запущено — отмена кнопкой в статусе задания.")
         return
 
     if data == "queue_clear":
@@ -996,6 +1081,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = data.split(":", 1)[1]
         if key in STYLE_LABELS:
             job["style"] = key
+            STATE["style"] = key
         await safe_edit(msg, ready_text(job), ready_kb(job))
         return
 
@@ -1006,13 +1092,19 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job["step"] = "banner"
         await ask_banner(msg, context)
     elif data == "skip_banner":
+        job.pop("banner_file_id", None)
         job["step"] = "cover"
         await ask_cover(msg, context)
     elif data == "use_banner":
         job["banner_file_id"] = STATE["banner"]
         job["step"] = "cover"
         await ask_cover(msg, context)
+    elif data == "auto_cover":
+        job["cover_text"] = AUTO_COVER
+        job["step"] = "ready"
+        await show_ready(msg, job, context)
     elif data == "skip_cover":
+        job.pop("cover_text", None)
         job["step"] = "ready"
         await show_ready(msg, job, context)
     elif data == "create":
