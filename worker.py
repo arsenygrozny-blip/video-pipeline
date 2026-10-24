@@ -110,14 +110,29 @@ LLM_PROMPT = (
     "Правила:\n"
     "- 4–7 слов. Если начало уже короткое, оставь его почти как есть, "
     "убрав только «ну», «вот», «короче», «типа», «как бы».\n"
-    "- Сохрани смысл. Если это вопрос — оставь вопросительный знак.\n"
-    "- Можно переформулировать, но не придумывай новую тему.\n"
+    "- Если в начале есть вопрос — верни именно вопрос (можно чуть короче), "
+    "а не ответ на него. Вопросительный знак обязателен.\n"
+    "- Сохрани смысл. Не придумывай новую тему.\n"
     "- Без кавычек, эмодзи, хэштегов и точки в конце.\n"
     "- Верни только текст обложки, без пояснений.\n"
     "Примеры:\n"
+    "«Какая вещь вас дико выбешивает? Меня бесят...» → «Какая вещь вас выбешивает?»\n"
     "«Какие самые интересные истории вы знаете?» → «Какие истории вы знаете?»\n"
     "«Сегодня расскажу, как я бросил курить» → «Как я бросил курить»\n"
     "«В этом видео я покажу, как приготовить пасту за 10 минут» → «Паста за 10 минут»"
+)
+LLM_PROMPT_Q = (
+    "Ты — редактор обложек для коротких видео на русском. "
+    "Тебе дают вопрос из начала озвучки. Сделай из него короткий "
+    "цепляющий текст обложки-вопрос.\n"
+    "Правила:\n"
+    "- 4–7 слов. Можно убрать лишние слова, но сохрани смысл.\n"
+    "- Верни именно вопрос, а не ответ на него. Вопросительный знак обязателен.\n"
+    "- Без кавычек, эмодзи, хэштегов и пояснений.\n"
+    "Примеры:\n"
+    "«Какая вещь вас дико выбешивает?» → «Какая вещь вас выбешивает?»\n"
+    "«Какие самые интересные истории вы знаете?» → «Какие истории вы знаете?»\n"
+    "«Почему мы всё время устаём?» → «Почему мы всё время устаём?»"
 )
 
 FONT_URLS = {
@@ -769,14 +784,14 @@ def _ollama_pull():
     return r.json()
 
 
-def _ollama_chat(opening, num_gpu=None):
+def _ollama_chat(opening, num_gpu=None, prompt=None):
     opts = {"temperature": 0.3, "num_predict": 48, "num_ctx": 2048}
     if num_gpu is not None:
         opts["num_gpu"] = num_gpu
     payload = {
         "model": LLM_MODEL,
         "messages": [
-            {"role": "system", "content": LLM_PROMPT},
+            {"role": "system", "content": prompt or LLM_PROMPT},
             {"role": "user", "content": opening},
         ],
         "stream": False,
@@ -788,14 +803,15 @@ def _ollama_chat(opening, num_gpu=None):
     return (r.json().get("message") or {}).get("content", "")
 
 
-def llm_cover_text(opening):
+def llm_cover_text(opening, question=False):
     _ensure_ollama()
     _ollama_pull()
+    prompt = LLM_PROMPT_Q if question else LLM_PROMPT
     try:
-        return _ollama_chat(opening)
+        return _ollama_chat(opening, prompt=prompt)
     except Exception as e:
         print("ollama: GPU-запуск не вышел, пробую CPU:", repr(e), flush=True)
-        return _ollama_chat(opening, num_gpu=0)
+        return _ollama_chat(opening, num_gpu=0, prompt=prompt)
 
 
 def clean_cover_text(raw):
@@ -805,6 +821,8 @@ def clean_cover_text(raw):
     t = t.splitlines()[0].strip().strip(" \"'«»“”`")
     t = re.sub(r"^(текст обложки|обложка|вариант)\s*[:—-]\s*", "", t, flags=re.I)
     t = re.sub(r"\s+", " ", t).strip().rstrip(" .,-—–")
+    if re.search(r"(?i)(а-а|ааа|ха-ха|хе-хе|ы-ы|э-э|ммм)", t):
+        return ""
     words = t.split()
     if len(words) < 2 or len(words) > 10:
         return ""
@@ -816,6 +834,14 @@ def clean_cover_text(raw):
     if not re.search(r"[А-Яа-яЁё]", t):
         return ""
     return t[0].upper() + t[1:]
+
+
+def first_question(text):
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s*", text) if p.strip()]
+    for p in parts:
+        if p.rstrip().endswith(("?", "?!")) and 2 <= len(p.split()) <= 14:
+            return p.strip(" \"'«»“”`")
+    return ""
 
 
 def first_line_cover(words, limit=60):
@@ -913,19 +939,29 @@ def make_video(job, banner, d):
     ctext = job.get("cover_text")
     if ctext == AUTO_COVER:
         notify("🖼 Придумываю текст обложки (ИИ)…")
-        opening = " ".join(w for _, _, w in words[:60]).strip()
+        opening = " ".join(w for _, _, w in words[:90]).strip()
         opening = re.sub(r"\s+([,.!?…:;])", r"\1", opening)
+        q = first_question(opening)
         ctext = ""
         if opening:
             try:
                 _free_whisper()
-                raw = llm_cover_text(opening)
+                raw = llm_cover_text(q or opening, question=bool(q))
                 ctext = clean_cover_text(raw)
+                if q and ctext and not ctext.endswith("?"):
+                    ctext = ""
                 print(f"обложка ИИ: «{raw.strip()[:120]}» → «{ctext}»", flush=True)
             except Exception as e:
                 print("ИИ-обложка не сработала:", repr(e), flush=True)
         if not ctext:
-            ctext = first_line_cover(words)
+            if q:
+                ctext = clean_cover_text(q)
+                if not ctext:
+                    ctext = first_line_cover(words)
+                    if ctext and not ctext.endswith("?"):
+                        ctext = ctext.rstrip(" .,!…") + "?"
+            else:
+                ctext = first_line_cover(words)
             print(f"обложка фолбэк: «{ctext}»", flush=True)
         if ctext:
             notify(f"🖼 Текст обложки: «{ctext}»")
