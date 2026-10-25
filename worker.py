@@ -1038,6 +1038,17 @@ def _watchdog():
     os._exit(1)
 
 
+def wake_render():
+    url = (JOB.get("render_url") or "").rstrip("/")
+    if not url:
+        return
+    try:
+        requests.get(url + "/", timeout=10)
+        print("render: разбудил", flush=True)
+    except Exception as e:
+        print("render: не разбудил:", repr(e), flush=True)
+
+
 def main():
     global FF
     wd = threading.Timer(TIME_LIMIT_MIN * 60, _watchdog)
@@ -1097,6 +1108,10 @@ def main():
         wd.cancel()
         try:
             _stop_ollama()
+        except Exception:
+            pass
+        try:
+            wake_render()
         except Exception:
             pass
         shutil.rmtree(d, ignore_errors=True)

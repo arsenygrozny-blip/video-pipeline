@@ -377,12 +377,14 @@ def kaggle_run(job, max_retries=4):
     slug = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
 
     last_err = None
+    idle = False
     for attempt in range(max_retries):
         try:
             st = api.kernels_status(slug)
             status = str(getattr(st, "status", st)).lower()
             if "running" in status or "queued" in status:
                 raise Busy()
+            idle = True
         except Busy:
             last_err = "Kaggle занят"
             if attempt < max_retries - 1:
@@ -394,6 +396,12 @@ def kaggle_run(job, max_retries=4):
         except Exception:
             pass  # ядра ещё нет, первый запуск
         break
+
+    if idle:
+        try:
+            kaggle_prune()
+        except Exception:
+            pass
 
     d = Path(tempfile.mkdtemp())
     script = "import json\nJOB = json.loads(" + repr(json.dumps(job, ensure_ascii=False)) + ")\n" + WORKER_SRC
@@ -462,7 +470,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update):
         return
     await update.message.reply_text(
-        "Готов. Жми «⚡ Быстро» — сделаю всё сам, или «🎬 Новое видео» для ручной настройки.",
+        "Готов. «⚡ Быстро» — сам подберу фон, баннер и обложку и добавлю в очередь. "
+        "«🎬 Новое видео» — ручная настройка.",
         reply_markup=MENU)
 
 
@@ -530,16 +539,19 @@ async def quick_build(msg, context, audio):
         "cover_text": AUTO_COVER,
         "step": "ready",
     })
-    QUEUE.insert(0, {"job": job, "chat_id": msg.chat_id})
-    RUNNING = True
+    QUEUE.append({"job": job, "chat_id": msg.chat_id})
+    RUNNING = False
     queue_save()
+    pos = len(QUEUE)
     banner_txt = "прошлый" if job.get("banner_file_id") else "нет"
-    note = ("Сейчас рендерится другое видео — это задание следующее."
-            if PROCESSING else "Запускаю.")
+    note = ("Сейчас рендерится другое видео — это следующее."
+            if PROCESSING else "Очередь на паузе.")
     _track(context, await msg.reply_text(
         f"⚡ Принял:\n• фон: {bg['name']}\n• баннер: {banner_txt}\n"
-        f"• обложка: авто (ИИ)\n"
-        f"• стиль: {STYLE_LABELS.get(job['style'], job['style'])}\n{note}",
+        f"• обложка: авто\n"
+        f"• стиль: {STYLE_LABELS.get(job['style'], job['style'])}\n"
+        f"📋 В очереди: {pos}. {note}\n"
+        f"▶️ Запусти кнопкой «▶️ Запустить».",
         reply_markup=kb([("🛑 Убрать из очереди", f"cancel_quick:{job['id']}")])))
 
 
@@ -815,14 +827,13 @@ async def launch(chat_id, job, bot):
         "chat_id": chat_id,
         "status_msg": status.message_id,
         "cookies": COOKIES_TXT,
+        "render_url": BASE_URL,
     })
     job.pop("step", None)
     try:
         await asyncio.to_thread(kaggle_run, job)
         await safe_edit(status, "⏳ Задание ушло. Старт ~несколько минут, дальше статусы и видео.",
                         kb([("🛑 Отменить", "cancel_run")]))
-        asyncio.get_event_loop().call_later(5, lambda: asyncio.ensure_future(
-            asyncio.to_thread(kaggle_prune)))
     except Busy:
         await safe_edit(status, "⏳ Kaggle ещё занят. Вернул задание в очередь.")
         raise
@@ -873,6 +884,20 @@ async def queue_worker(app):
         finally:
             PROCESSING = False
             queue_save()
+        await asyncio.sleep(20)
+
+
+async def keepalive(app):
+    if not BASE_URL:
+        return
+    while True:
+        await asyncio.sleep(300)
+        if not (PROCESSING or (RUNNING and QUEUE)):
+            continue
+        try:
+            await asyncio.to_thread(requests.get, BASE_URL + "/", timeout=30)
+        except Exception as e:
+            print("keepalive:", e, flush=True)
 
 
 def queue_snapshot():
@@ -1111,10 +1136,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("job", None)
         context.user_data.pop("bg_flow", None)
         await cleanup_flow(msg.chat_id, context, context.bot)
+        RUNNING = False
         QUEUE.append({"job": job, "chat_id": msg.chat_id})
         queue_save()
         pos = len(QUEUE)
-        run_info = "\n▶️ Нажми «Запустить» в очереди, когда будешь готов." if not RUNNING else ""
+        run_info = "\n▶️ Очередь на паузе — нажми «Запустить», когда будешь готов."
         await context.bot.send_message(
             msg.chat_id,
             f"✅ В очереди: {pos} видео.{run_info}",
@@ -1259,6 +1285,7 @@ def main():
         await asyncio.to_thread(queue_load)
         await asyncio.to_thread(backgrounds_load)
         app.create_task(queue_worker(app))
+        app.create_task(keepalive(app))
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
