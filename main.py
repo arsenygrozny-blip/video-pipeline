@@ -552,7 +552,8 @@ async def quick_build(msg, context, audio):
         f"• стиль: {STYLE_LABELS.get(job['style'], job['style'])}\n"
         f"📋 В очереди: {pos}. {note}\n"
         f"▶️ Запусти кнопкой «▶️ Запустить».",
-        reply_markup=kb([("🛑 Убрать из очереди", f"cancel_quick:{job['id']}")])))
+        reply_markup=kb([("▶️ Запустить", "queue_run"),
+                         ("🛑 Убрать из очереди", f"cancel_quick:{job['id']}")])))
 
 
 def bgs_kb(job):
