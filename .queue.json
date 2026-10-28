@@ -1,1 +1,1 @@
-{"queue": [], "running": true}
+{"queue": [{"job": {"id": "730ce1c8", "step": "ready", "bgs": [{"url": "https://vt.tiktok.com/ZSgSSJEjG/", "name": "А", "source": "library", "bg_id": "bg_05d25effdda3", "end_time": null}], "style": "classic", "audio": "https://vt.tiktok.com/ZSgpjKXxM/", "banner_file_id": "BAACAgIAAxkBAAIEx2rh6m3dpT-1CMG-X4z573qPoUzUAAItngACEYUQS4kVFS05Qu_XPQQ", "cover_text": "__auto__"}, "chat_id": 5394667051}], "running": false}
