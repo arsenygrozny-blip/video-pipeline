@@ -891,12 +891,14 @@ async def queue_worker(app):
 async def keepalive(app):
     if not BASE_URL:
         return
+    first = True
     while True:
         await asyncio.sleep(300)
-        if not (PROCESSING or (RUNNING and QUEUE)):
-            continue
         try:
-            await asyncio.to_thread(requests.get, BASE_URL + "/", timeout=30)
+            r = await asyncio.to_thread(requests.get, BASE_URL + "/", timeout=60)
+            if first:
+                print(f"keepalive: старт, ответ {r.status_code}", flush=True)
+                first = False
         except Exception as e:
             print("keepalive:", e, flush=True)
 
@@ -1308,6 +1310,7 @@ def main():
         webhook_url=f"{BASE_URL}/{URL_PATH}",
         secret_token=SECRET,
         drop_pending_updates=False,
+        max_connections=10,
     )
 
 
