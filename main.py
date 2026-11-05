@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from kaggle.api.kaggle_api_extended import KaggleApi
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -352,8 +353,6 @@ def extract_preview(url):
 
 # ---------------------------- запуск Kaggle ----------------------------
 def kaggle_api():
-    from kaggle.api.kaggle_api_extended import KaggleApi
-
     if not os.environ.get("KAGGLE_USERNAME") or not os.environ.get("KAGGLE_KEY"):
         raise RuntimeError("На Render не заданы KAGGLE_USERNAME и/или KAGGLE_KEY.")
     api = KaggleApi()
