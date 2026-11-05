@@ -55,6 +55,7 @@ QUEUE = []          # [{"job": {...}, "chat_id": int}]
 BACKGROUNDS = []    # [{"id", "url", "name", "end_time", "preview_id", "added_at"}]
 PROCESSING = False
 RUNNING = False
+BG_TASKS = set()
 
 STYLES = [
     ("classic", "Классика"),
@@ -843,8 +844,26 @@ async def launch(chat_id, job, bot):
 
 
 # ---------------------------- обработчик очереди ----------------------------
+def _bg_done(task):
+    BG_TASKS.discard(task)
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"BG {task.get_name()}: {e}", flush=True)
+
+
+def start_bg(coro, name):
+    task = asyncio.create_task(coro, name=name)
+    BG_TASKS.add(task)
+    task.add_done_callback(_bg_done)
+    return task
+
+
 async def queue_worker(app):
     global PROCESSING
+    print("queue_worker: старт", flush=True)
     while True:
         await asyncio.sleep(8)
         if PROCESSING or not RUNNING or not QUEUE:
@@ -890,6 +909,7 @@ async def queue_worker(app):
 async def keepalive(app):
     if not BASE_URL:
         return
+    print("keepalive: старт", flush=True)
     first = True
     while True:
         await asyncio.sleep(300)
@@ -1286,8 +1306,8 @@ def main():
     async def _post_init(app):
         await asyncio.to_thread(queue_load)
         await asyncio.to_thread(backgrounds_load)
-        app.bot_data["queue_worker_task"] = app.create_task(queue_worker(app), name="queue_worker")
-        app.bot_data["keepalive_task"] = app.create_task(keepalive(app), name="keepalive")
+        start_bg(queue_worker(app), "queue_worker")
+        start_bg(keepalive(app), "keepalive")
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
