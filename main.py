@@ -1286,8 +1286,8 @@ def main():
     async def _post_init(app):
         await asyncio.to_thread(queue_load)
         await asyncio.to_thread(backgrounds_load)
-        app.create_task(queue_worker(app))
-        app.create_task(keepalive(app))
+        app.bot_data["queue_worker_task"] = app.create_task(queue_worker(app), name="queue_worker")
+        app.bot_data["keepalive_task"] = app.create_task(keepalive(app), name="keepalive")
 
     app = Application.builder().token(BOT_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
